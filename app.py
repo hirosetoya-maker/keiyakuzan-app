@@ -20,11 +20,23 @@ st.markdown(
 <style>
 /* Streamlit の不要な要素を非表示 */
 #MainMenu        {display: none !important;}
-header           {display: none !important;}
 footer           {display: none !important;}
 [data-testid="stDeployButton"]   {display: none !important;}
 [data-testid="stStatusWidget"]   {display: none !important;}
 [data-testid="stToolbar"]        {display: none !important;}
+/* ヘッダーは透明化して高さ0に（サイドバートグルボタンだけ残す） */
+header {
+    visibility: hidden !important;
+    position: fixed !important;
+    top: 0; left: 0;
+    height: 0 !important;
+    overflow: visible !important;
+    pointer-events: none !important;
+}
+[data-testid="stSidebarCollapsedControl"] {
+    visibility: visible !important;
+    pointer-events: all !important;
+}
 /* データエディタの列ヘッダーメニューを非表示 */
 .ag-header-cell-menu-button      {display: none !important;}
 .ag-icon-menu                    {display: none !important;}
@@ -55,6 +67,42 @@ footer           {display: none !important;}
     unsafe_allow_html=True,
 )
 
+
+# ── ダークモード CSS ────────────────────────────────────────────────────────────
+DARK_MODE_CSS = """
+<style>
+.stApp,
+[data-testid="stAppViewContainer"],
+[data-testid="stMain"],
+[data-testid="block-container"] {
+    background-color: #0e1117 !important;
+    color: #e0e4f0 !important;
+}
+[data-testid="stSidebar"] { background-color: #161b2e !important; }
+[data-testid="stSidebar"] * { color: #e0e4f0 !important; }
+[data-testid="stMetric"] {
+    background: #1a1f2e !important;
+    border-color: #2d3d6b !important;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.4) !important;
+}
+[data-testid="stMetric"] * { color: #e0e4f0 !important; }
+.stTextInput > div > div > input,
+.stNumberInput > div > div > input {
+    background-color: #1a1f2e !important;
+    color: #e0e4f0 !important;
+    border-color: #3d4466 !important;
+}
+label, p, h1, h2, h3, h4, h5 { color: #e0e4f0 !important; }
+hr { border-color: #2d3d6b !important; }
+[data-testid="stExpander"] {
+    border-color: #2d3d6b !important;
+    background-color: #1a1f2e !important;
+}
+[data-testid="stDataEditor"] > div { background-color: #1a1f2e !important; }
+[data-testid="stRadio"] * { color: #e0e4f0 !important; }
+.stCaption { color: #8892b0 !important; }
+</style>
+"""
 
 # ── Supabase クライアント ──────────────────────────────────────────────────────
 @st.cache_resource
@@ -105,6 +153,30 @@ def load_data() -> pd.DataFrame:
 
     df["remaining_qty"] = pd.to_numeric(df.apply(calc_remaining, axis=1), errors="coerce")
     return df
+
+
+# ── 取込済み年月一覧（データ管理用） ──────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_delivery_months() -> dict[str, int]:
+    """deliveries テーブルから年月ごとのレコード数を返す（新しい順）"""
+    supabase = get_supabase()
+    PAGE_SIZE = 1000
+    offset = 0
+    month_counts: dict[str, int] = {}
+    while True:
+        res = (
+            supabase.table("deliveries")
+            .select("delivery_date")
+            .range(offset, offset + PAGE_SIZE - 1)
+            .execute()
+        )
+        for row in res.data:
+            ym = str(row["delivery_date"])[:7]  # "YYYY-MM"
+            month_counts[ym] = month_counts.get(ym, 0) + 1
+        if len(res.data) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return dict(sorted(month_counts.items(), reverse=True))
 
 
 # ── 認証画面 ──────────────────────────────────────────────────────────────────
@@ -253,6 +325,10 @@ def page_contracts() -> None:
     if memo_col:
         display_cols.append("memo")
     display_df = filtered[display_cols].copy()
+    # NaN を pandas nullable Float64 に変換（Arrow シリアライズ時の "None" 表示を防ぐ）
+    for col in ("contract_qty", "remaining_qty"):
+        if col in display_df.columns:
+            display_df[col] = display_df[col].astype("Float64")
     display_df["is_completed"] = False
 
     col_config = {
@@ -638,9 +714,81 @@ def page_csv_import() -> None:
     load_data.clear()
 
 
+# ── Page 3: データ管理 ────────────────────────────────────────────────────────
+def page_data_management() -> None:
+    st.header("データ管理")
+    supabase = get_supabase()
+
+    # ── 削除確認ダイアログ（優先表示） ──────────────────────────────────────
+    if "pending_month_delete" in st.session_state:
+        months: list[str] = st.session_state["pending_month_delete"]
+        labels = "、".join([f"{m[:4]}年{int(m[5:7])}月" for m in months])
+        st.warning(
+            f"⚠️ **{labels}** の出荷実績データをすべて削除します。  \n"
+            "この操作は取り消せません。契約情報（現場名・契約数量・備考）は削除されません。"
+        )
+        col1, col2, _ = st.columns([1, 1, 5])
+        with col1:
+            if st.button("🗑️ 削除する", type="primary", key="btn_confirm_month_delete"):
+                for ym in months:
+                    year, month_int = int(ym[:4]), int(ym[5:7])
+                    next_year  = year + (1 if month_int == 12 else 0)
+                    next_month = 1 if month_int == 12 else month_int + 1
+                    next_ym    = f"{next_year:04d}-{next_month:02d}-01"
+                    supabase.table("deliveries").delete().gte(
+                        "delivery_date", f"{ym}-01"
+                    ).lt("delivery_date", next_ym).execute()
+                count = len(months)
+                st.session_state.pop("pending_month_delete", None)
+                load_delivery_months.clear()
+                load_data.clear()
+                st.success(f"✅ {labels} の出荷実績（{count}ヶ月分）を削除しました")
+                st.rerun()
+        with col2:
+            if st.button("キャンセル", key="btn_cancel_month_delete"):
+                st.session_state.pop("pending_month_delete", None)
+                st.rerun()
+        return
+
+    # ── 取込済みデータ一覧 ────────────────────────────────────────────────────
+    st.subheader("取込済み出荷実績（月別）")
+    st.caption("間違えて取り込んだ月のチェックボックスを選択して削除できます。契約情報は削除されません。")
+    st.markdown("---")
+
+    month_counts = load_delivery_months()
+
+    if not month_counts:
+        st.info("取込済みの出荷実績データがありません。")
+        return
+
+    selected_months: list[str] = []
+    for ym, count in month_counts.items():
+        year, mon = ym[:4], str(int(ym[5:7]))
+        if st.checkbox(f"**{year}年{mon}月**　　{count:,} 件", key=f"chk_{ym}"):
+            selected_months.append(ym)
+
+    if selected_months:
+        labels = "、".join([f"{m[:4]}年{int(m[5:7])}月" for m in selected_months])
+        st.markdown("---")
+        st.warning(f"⚠️ {labels} を選択中（{len(selected_months)}ヶ月）")
+        if st.button(
+            f"🗑️ 選択した月の出荷データを削除（{len(selected_months)}ヶ月）",
+            type="primary",
+            key="btn_month_delete",
+        ):
+            st.session_state["pending_month_delete"] = selected_months
+            st.rerun()
+
+
 # ── エントリーポイント ─────────────────────────────────────────────────────────
 def main() -> None:
+    # ダークモード初期化
+    if "dark_mode" not in st.session_state:
+        st.session_state.dark_mode = False
+
     if not st.session_state.get("authenticated", False):
+        if st.session_state.dark_mode:
+            st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
         show_login()
         st.stop()
 
@@ -648,19 +796,26 @@ def main() -> None:
         st.markdown("## 🏗️ 生コン契約残管理\n**中央コンクリート**")
         st.markdown("---")
         page = st.radio(
-            "", ["契約残一覧", "CSV取込"],
+            "", ["契約残一覧", "CSV取込", "データ管理"],
             label_visibility="collapsed",
             key="nav",
         )
+        st.markdown("---")
+        st.toggle("🌙 ダークモード", key="dark_mode")
         st.markdown("---")
         if st.button("ログアウト", key="btn_logout"):
             st.session_state.authenticated = False
             st.rerun()
 
+    if st.session_state.dark_mode:
+        st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
+
     if page == "契約残一覧":
         page_contracts()
-    else:
+    elif page == "CSV取込":
         page_csv_import()
+    else:
+        page_data_management()
 
 
 if __name__ == "__main__":
