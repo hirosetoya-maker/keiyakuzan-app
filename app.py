@@ -24,19 +24,10 @@ footer           {display: none !important;}
 [data-testid="stDeployButton"]   {display: none !important;}
 [data-testid="stStatusWidget"]   {display: none !important;}
 [data-testid="stToolbar"]        {display: none !important;}
-/* ヘッダーは透明化して高さ0に（サイドバートグルボタンだけ残す） */
-header {
-    visibility: hidden !important;
-    position: fixed !important;
-    top: 0; left: 0;
-    height: 0 !important;
-    overflow: visible !important;
-    pointer-events: none !important;
-}
-[data-testid="stSidebarCollapsedControl"] {
-    visibility: visible !important;
-    pointer-events: all !important;
-}
+/* ヘッダーを非表示 */
+header           {display: none !important;}
+/* サイドバーの「閉じる」ボタンを非表示（畳めないようにする） */
+[data-testid="stSidebarCollapseButton"] {display: none !important;}
 /* データエディタの列ヘッダーメニューを非表示 */
 .ag-header-cell-menu-button      {display: none !important;}
 .ag-icon-menu                    {display: none !important;}
