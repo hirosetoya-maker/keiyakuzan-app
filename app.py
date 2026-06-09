@@ -26,8 +26,15 @@ footer           {display: none !important;}
 [data-testid="stToolbar"]        {display: none !important;}
 /* ヘッダーを非表示 */
 header           {display: none !important;}
-/* サイドバーの「閉じる」ボタンを非表示（畳めないようにする） */
+/* サイドバーを常に表示（畳めないようにする） */
+[data-testid="stSidebar"] {
+    transform: translateX(0) !important;
+    min-width: 244px !important;
+    width: 244px !important;
+    display: block !important;
+}
 [data-testid="stSidebarCollapseButton"] {display: none !important;}
+[data-testid="stSidebarCollapsedControl"] {display: none !important;}
 /* データエディタの列ヘッダーメニューを非表示 */
 .ag-header-cell-menu-button      {display: none !important;}
 .ag-icon-menu                    {display: none !important;}
