@@ -11,30 +11,32 @@ st.set_page_config(
     page_title="生コン契約残管理",
     page_icon="🏗️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 # ── カスタムCSS ────────────────────────────────────────────────────────────────
 st.markdown(
     """
 <style>
-/* Streamlit の不要な要素を非表示 */
+/* 全デバイス共通：不要UI非表示 */
 #MainMenu        {display: none !important;}
 footer           {display: none !important;}
 [data-testid="stDeployButton"]   {display: none !important;}
 [data-testid="stStatusWidget"]   {display: none !important;}
 [data-testid="stToolbar"]        {display: none !important;}
-/* ヘッダーを非表示 */
-header           {display: none !important;}
-/* サイドバーを常に表示（畳めないようにする） */
-[data-testid="stSidebar"] {
-    transform: translateX(0) !important;
-    min-width: 244px !important;
-    width: 244px !important;
-    display: block !important;
+
+/* デスクトップ：ヘッダー非表示、サイドバー常時表示 */
+@media (min-width: 641px) {
+    header {display: none !important;}
+    [data-testid="stSidebar"] {
+        transform: translateX(0) !important;
+        min-width: 244px !important;
+        width: 244px !important;
+        display: block !important;
+    }
+    [data-testid="stSidebarCollapseButton"]   {display: none !important;}
+    [data-testid="stSidebarCollapsedControl"] {display: none !important;}
 }
-[data-testid="stSidebarCollapseButton"] {display: none !important;}
-[data-testid="stSidebarCollapsedControl"] {display: none !important;}
 /* データエディタの列ヘッダーメニューを非表示 */
 .ag-header-cell-menu-button      {display: none !important;}
 .ag-icon-menu                    {display: none !important;}
@@ -712,35 +714,147 @@ def page_csv_import() -> None:
     load_data.clear()
 
 
+# ── データ管理ヘルパー ─────────────────────────────────────────────────────────
+def _delete_months_and_orphans(supabase: Client, months: list[str]) -> int:
+    """月別出荷実績を削除し、出荷実績のなくなった契約も削除する。削除した契約数を返す。"""
+    affected: set[str] = set()
+
+    for ym in months:
+        year, month_int = int(ym[:4]), int(ym[5:7])
+        next_year  = year + (1 if month_int == 12 else 0)
+        next_month = 1 if month_int == 12 else month_int + 1
+        next_ym    = f"{next_year:04d}-{next_month:02d}-01"
+
+        # 削除対象月に含まれる contract_no を事前取得
+        offset = 0
+        while True:
+            res = (
+                supabase.table("deliveries").select("contract_no")
+                .gte("delivery_date", f"{ym}-01").lt("delivery_date", next_ym)
+                .range(offset, offset + 999).execute()
+            )
+            for row in res.data:
+                affected.add(row["contract_no"])
+            if len(res.data) < 1000:
+                break
+            offset += 1000
+
+        # deliveries を削除
+        supabase.table("deliveries").delete().gte(
+            "delivery_date", f"{ym}-01"
+        ).lt("delivery_date", next_ym).execute()
+
+    if not affected:
+        return 0
+
+    # 削除後も残存 deliveries がある contract_no を取得
+    remaining: set[str] = set()
+    affected_list = list(affected)
+    for i in range(0, len(affected_list), 200):
+        res = supabase.table("deliveries").select("contract_no").in_(
+            "contract_no", affected_list[i : i + 200]
+        ).execute()
+        for row in res.data:
+            remaining.add(row["contract_no"])
+
+    # 孤立契約（残存 deliveries ゼロ）を削除
+    orphans = list(affected - remaining)
+    for i in range(0, len(orphans), 200):
+        supabase.table("contracts").delete().in_(
+            "contract_no", orphans[i : i + 200]
+        ).execute()
+
+    return len(orphans)
+
+
+def _count_orphan_contracts(supabase: Client) -> int:
+    """出荷実績のない契約の件数を返す"""
+    has_delivery: set[str] = set()
+    offset = 0
+    while True:
+        res = supabase.table("deliveries").select("contract_no").range(
+            offset, offset + 999
+        ).execute()
+        for row in res.data:
+            has_delivery.add(row["contract_no"])
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+
+    count = 0
+    offset = 0
+    while True:
+        res = supabase.table("contracts").select("contract_no").range(
+            offset, offset + 999
+        ).execute()
+        for row in res.data:
+            if row["contract_no"] not in has_delivery:
+                count += 1
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+    return count
+
+
+def _delete_orphan_contracts(supabase: Client) -> int:
+    """出荷実績のない契約をすべて削除する。削除件数を返す。"""
+    has_delivery: set[str] = set()
+    offset = 0
+    while True:
+        res = supabase.table("deliveries").select("contract_no").range(
+            offset, offset + 999
+        ).execute()
+        for row in res.data:
+            has_delivery.add(row["contract_no"])
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+
+    orphans: list[str] = []
+    offset = 0
+    while True:
+        res = supabase.table("contracts").select("contract_no").range(
+            offset, offset + 999
+        ).execute()
+        for row in res.data:
+            if row["contract_no"] not in has_delivery:
+                orphans.append(row["contract_no"])
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+
+    for i in range(0, len(orphans), 200):
+        supabase.table("contracts").delete().in_(
+            "contract_no", orphans[i : i + 200]
+        ).execute()
+    return len(orphans)
+
+
 # ── Page 3: データ管理 ────────────────────────────────────────────────────────
 def page_data_management() -> None:
     st.header("データ管理")
     supabase = get_supabase()
 
-    # ── 削除確認ダイアログ（優先表示） ──────────────────────────────────────
+    # ── 月削除確認ダイアログ（優先表示） ────────────────────────────────────
     if "pending_month_delete" in st.session_state:
         months: list[str] = st.session_state["pending_month_delete"]
         labels = "、".join([f"{m[:4]}年{int(m[5:7])}月" for m in months])
         st.warning(
-            f"⚠️ **{labels}** の出荷実績データをすべて削除します。  \n"
-            "この操作は取り消せません。契約情報（現場名・契約数量・備考）は削除されません。"
+            f"⚠️ **{labels}** の出荷実績データをすべて削除します。\n\n"
+            "出荷実績がなくなった契約も自動的に契約残一覧から削除されます。\n"
+            "この操作は取り消せません。"
         )
         col1, col2, _ = st.columns([1, 1, 5])
         with col1:
             if st.button("🗑️ 削除する", type="primary", key="btn_confirm_month_delete"):
-                for ym in months:
-                    year, month_int = int(ym[:4]), int(ym[5:7])
-                    next_year  = year + (1 if month_int == 12 else 0)
-                    next_month = 1 if month_int == 12 else month_int + 1
-                    next_ym    = f"{next_year:04d}-{next_month:02d}-01"
-                    supabase.table("deliveries").delete().gte(
-                        "delivery_date", f"{ym}-01"
-                    ).lt("delivery_date", next_ym).execute()
-                count = len(months)
+                deleted_contracts = _delete_months_and_orphans(supabase, months)
                 st.session_state.pop("pending_month_delete", None)
                 load_delivery_months.clear()
                 load_data.clear()
-                st.success(f"✅ {labels} の出荷実績（{count}ヶ月分）を削除しました")
+                st.success(
+                    f"✅ {labels} の出荷実績を削除しました。"
+                    f"（関連契約 {deleted_contracts:,}件 も削除）"
+                )
                 st.rerun()
         with col2:
             if st.button("キャンセル", key="btn_cancel_month_delete"):
@@ -748,34 +862,72 @@ def page_data_management() -> None:
                 st.rerun()
         return
 
+    # ── 孤立契約削除確認ダイアログ ──────────────────────────────────────────
+    if "pending_orphan_delete" in st.session_state:
+        orphan_count = st.session_state["pending_orphan_delete"]
+        st.warning(
+            f"⚠️ 契約一覧に残っている **{orphan_count:,}件** をすべて削除します。\n\n"
+            "出荷データと紐づいていない契約がすべて削除されます。この操作は取り消せません。"
+        )
+        col1, col2, _ = st.columns([1, 1, 5])
+        with col1:
+            if st.button("🗑️ 削除する", type="primary", key="btn_confirm_orphan_delete"):
+                deleted = _delete_orphan_contracts(supabase)
+                st.session_state.pop("pending_orphan_delete", None)
+                load_data.clear()
+                st.success(f"✅ {deleted:,}件の契約を削除しました")
+                st.rerun()
+        with col2:
+            if st.button("キャンセル", key="btn_cancel_orphan_delete"):
+                st.session_state.pop("pending_orphan_delete", None)
+                st.rerun()
+        return
+
     # ── 取込済みデータ一覧 ────────────────────────────────────────────────────
     st.subheader("取込済み出荷実績（月別）")
-    st.caption("間違えて取り込んだ月のチェックボックスを選択して削除できます。契約情報は削除されません。")
+    st.caption("間違えて取り込んだ月を選択して削除できます。出荷実績がなくなった契約も自動で一覧から削除されます。")
     st.markdown("---")
 
     month_counts = load_delivery_months()
 
     if not month_counts:
         st.info("取込済みの出荷実績データがありません。")
-        return
+    else:
+        selected_months: list[str] = []
+        for ym, cnt in month_counts.items():
+            year, mon = ym[:4], str(int(ym[5:7]))
+            if st.checkbox(f"**{year}年{mon}月**　　{cnt:,} 件", key=f"chk_{ym}"):
+                selected_months.append(ym)
 
-    selected_months: list[str] = []
-    for ym, count in month_counts.items():
-        year, mon = ym[:4], str(int(ym[5:7]))
-        if st.checkbox(f"**{year}年{mon}月**　　{count:,} 件", key=f"chk_{ym}"):
-            selected_months.append(ym)
+        if selected_months:
+            labels = "、".join([f"{m[:4]}年{int(m[5:7])}月" for m in selected_months])
+            st.markdown("---")
+            st.warning(f"⚠️ {labels} を選択中（{len(selected_months)}ヶ月）")
+            if st.button(
+                f"🗑️ 選択した月の出荷データを削除（{len(selected_months)}ヶ月）",
+                type="primary",
+                key="btn_month_delete",
+            ):
+                st.session_state["pending_month_delete"] = selected_months
+                st.rerun()
 
-    if selected_months:
-        labels = "、".join([f"{m[:4]}年{int(m[5:7])}月" for m in selected_months])
-        st.markdown("---")
-        st.warning(f"⚠️ {labels} を選択中（{len(selected_months)}ヶ月）")
+    # ── クリーンアップ ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("クリーンアップ")
+    orphan_count = _count_orphan_contracts(supabase)
+    if orphan_count > 0:
+        st.caption(
+            f"出荷データと紐づいていない契約が **{orphan_count:,}件** あります。"
+            "取込データをすべて削除した場合など、契約一覧に残ったデータをここで削除できます。"
+        )
         if st.button(
-            f"🗑️ 選択した月の出荷データを削除（{len(selected_months)}ヶ月）",
-            type="primary",
-            key="btn_month_delete",
+            f"🗑️ 契約一覧をリセット（{orphan_count:,}件削除）",
+            key="btn_orphan_delete",
         ):
-            st.session_state["pending_month_delete"] = selected_months
+            st.session_state["pending_orphan_delete"] = orphan_count
             st.rerun()
+    else:
+        st.caption("契約一覧は最新の取込データと一致しています。")
 
 
 # ── エントリーポイント ─────────────────────────────────────────────────────────
