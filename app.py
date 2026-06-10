@@ -101,6 +101,12 @@ hr { border-color: #2d3d6b !important; }
 [data-testid="stDataEditor"] > div { background-color: #1a1f2e !important; }
 [data-testid="stRadio"] * { color: #e0e4f0 !important; }
 .stCaption { color: #8892b0 !important; }
+[data-testid="stBaseButton-secondary"] {
+    background-color: #1a1f2e !important;
+    color: #e0e4f0 !important;
+    border: 1px solid #3d4466 !important;
+}
+[data-testid="stBaseButton-secondary"] * { color: #e0e4f0 !important; }
 </style>
 """
 
@@ -351,56 +357,153 @@ def page_contracts() -> None:
 
     editor_key = f"editor_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
+    st.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
+
     if df.empty:
         st.info("データがありません。まずCSV取込を行ってください。")
-    else:
-        # 自動保存済みメッセージ
-        if st.session_state.pop("autosaved_count", None):
-            st.success("✅ 自動保存しました")
+        st.markdown("---")
+        _show_add_form(df, supabase)
+        return
 
-        # データエディタ
-        st.data_editor(
-            display_df,
-            column_config=col_config,
-            use_container_width=True,
-            hide_index=True,
-            num_rows="fixed",
-            key=editor_key,
-        )
+    edit_mode = st.toggle("✏️ 編集モード（契約数量・備考の修正、完了削除）", key="edit_mode")
 
-        editor_state = st.session_state.get(editor_key, {})
-        edited_rows  = editor_state.get("edited_rows", {})
+    if not edit_mode:
+        _render_view_table(filtered)
+        st.markdown("---")
+        _show_add_form(df, supabase)
+        return
 
-        # 完了チェック済み行を収集 → まとめて削除ボタン
-        checked_for_delete = [
-            {
-                "contract_no": str(display_df.iloc[int(idx)]["contract_no"]),
-                "field_name":  str(display_df.iloc[int(idx)]["field_name"]),
-            }
-            for idx, changes in edited_rows.items()
-            if changes.get("is_completed")
-        ]
-        if checked_for_delete:
-            st.warning(f"⚠️ **{len(checked_for_delete)}件** が完了チェックされています")
-            if st.button(
-                f"🗑️ 完了現場を削除（{len(checked_for_delete)}件）",
-                type="primary", key="btn_batch_delete",
-            ):
-                st.session_state["pending_delete"] = checked_for_delete
-                st.rerun()
+    # ── 編集モード ────────────────────────────────────────────────────────────
+    # 自動保存済みメッセージ
+    if st.session_state.pop("autosaved_count", None):
+        st.success("✅ 自動保存しました")
 
-        # 数量・備考の自動保存
-        save_edits = {
-            idx: {k: v for k, v in changes.items() if k in ("contract_qty", "memo")}
-            for idx, changes in edited_rows.items()
-            if any(k in ("contract_qty", "memo") for k in changes)
+    # データエディタ
+    st.data_editor(
+        display_df,
+        column_config=col_config,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key=editor_key,
+    )
+
+    editor_state = st.session_state.get(editor_key, {})
+    edited_rows  = editor_state.get("edited_rows", {})
+
+    # 完了チェック済み行を収集 → まとめて削除ボタン
+    checked_for_delete = [
+        {
+            "contract_no": str(display_df.iloc[int(idx)]["contract_no"]),
+            "field_name":  str(display_df.iloc[int(idx)]["field_name"]),
         }
-        if save_edits:
-            _handle_save(display_df, save_edits, supabase)
+        for idx, changes in edited_rows.items()
+        if changes.get("is_completed")
+    ]
+    if checked_for_delete:
+        st.warning(f"⚠️ **{len(checked_for_delete)}件** が完了チェックされています")
+        if st.button(
+            f"🗑️ 完了現場を削除（{len(checked_for_delete)}件）",
+            type="primary", key="btn_batch_delete",
+        ):
+            st.session_state["pending_delete"] = checked_for_delete
+            st.rerun()
+
+    # 数量・備考の自動保存
+    save_edits = {
+        idx: {k: v for k, v in changes.items() if k in ("contract_qty", "memo")}
+        for idx, changes in edited_rows.items()
+        if any(k in ("contract_qty", "memo") for k in changes)
+    }
+    if save_edits:
+        _handle_save(display_df, save_edits, supabase)
 
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
     _show_add_form(df, supabase)
+
+
+def _render_view_table(filtered: pd.DataFrame) -> None:
+    """閲覧モード：色強調・消化率バー・並び替え可能な読み取り専用テーブル"""
+    view_df = filtered.copy()
+
+    # 消化率（%）。契約数量が未設定・0 の行は計算不可なので空欄
+    def _calc_pct(row):
+        qty = row["contract_qty"]
+        if pd.isna(qty) or float(qty) <= 0:
+            return None
+        return float(row["shipped_qty"]) / float(qty) * 100.0
+
+    view_df["consumption_pct"] = view_df.apply(_calc_pct, axis=1)
+
+    # 初期表示は契約残が多い順（列見出しクリックでいつでも並び替え可）
+    view_df = (
+        view_df
+        .sort_values("remaining_qty", ascending=False, na_position="last")
+        .reset_index(drop=True)
+    )
+
+    view_cols = [
+        "contract_no", "seller", "secondary_seller", "general_contractor",
+        "field_name", "contract_qty", "shipped_qty", "remaining_qty",
+        "consumption_pct",
+    ]
+    if "memo" in view_df.columns:
+        view_cols.append("memo")
+    view_df = view_df[view_cols]
+
+    view_df["consumption_pct"] = pd.to_numeric(
+        view_df["consumption_pct"], errors="coerce"
+    ).astype(float)
+
+    # 残り50%以上（＝出荷が進んでいない要注意現場）を黄色でハイライト
+    # ※数値列を文字列化する前に判定用の値を保持しておく
+    qty_num = pd.to_numeric(view_df["contract_qty"], errors="coerce")
+    rem_num = pd.to_numeric(view_df["remaining_qty"], errors="coerce")
+    warn_mask = (qty_num > 0) & (rem_num / qty_num >= 0.5)
+
+    # 数値列は文字列化する。st.dataframe は数値列の欠損を灰色の "None" と
+    # 描画してしまうため、空欄にするには文字列にするしかない。
+    # 右詰め固定幅・固定小数点なら、文字列の列でも見出しクリックの
+    # 並び替え結果が数値順と一致する。
+    def _fmt_qty(v):
+        v = pd.to_numeric(v, errors="coerce")
+        return "" if pd.isna(v) else f"{float(v):>10,.1f}"
+
+    for c in ("contract_qty", "shipped_qty", "remaining_qty"):
+        view_df[c] = view_df[c].map(_fmt_qty)
+
+    def _row_style(row):
+        if warn_mask.iloc[row.name]:
+            return ["background-color: #fff3cd; color: #5c4a00;"] * len(row)
+        return [""] * len(row)
+
+    styler = view_df.style.apply(_row_style, axis=1)
+
+    st.dataframe(
+        styler,
+        column_config={
+            "contract_no":        st.column_config.TextColumn("契約NO", width="small"),
+            "seller":             st.column_config.TextColumn("販売店", width="medium"),
+            "secondary_seller":   st.column_config.TextColumn("二次店", width="small"),
+            "general_contractor": st.column_config.TextColumn("ゼネコン", width="medium"),
+            "field_name":         st.column_config.TextColumn("現場名", width="large"),
+            "contract_qty":       st.column_config.TextColumn(
+                                      "契約数量（m³）", width="small", alignment="right"),
+            "shipped_qty":        st.column_config.TextColumn(
+                                      "出荷実績（m³）", width="small", alignment="right"),
+            "remaining_qty":      st.column_config.TextColumn(
+                                      "契約残（m³）", width="small", alignment="right"),
+            "consumption_pct":    st.column_config.ProgressColumn(
+                                      "消化率", format="%.0f%%",
+                                      min_value=0, max_value=100),
+            "memo":               st.column_config.TextColumn("備考", width="medium"),
+        },
+        use_container_width=True,
+        hide_index=True,
+        height=600,
+    )
+    st.caption("🟨 黄色の行＝契約残が50%以上（出荷が進んでいない要注意現場）　／　列見出しをクリックすると並び替えできます")
 
 
 def _handle_save(
