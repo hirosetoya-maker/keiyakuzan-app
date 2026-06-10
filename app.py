@@ -1,6 +1,11 @@
+import hashlib
+import hmac
 import io
 import time
+import uuid
+from datetime import datetime, timedelta
 
+import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
 from dateutil import parser as dateutil_parser
@@ -11,7 +16,7 @@ st.set_page_config(
     page_title="生コン契約残管理",
     page_icon="🏗️",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="expanded",
 )
 
 # ── カスタムCSS ────────────────────────────────────────────────────────────────
@@ -19,23 +24,18 @@ st.markdown(
     """
 <style>
 /* 全デバイス共通：不要UI非表示 */
+/* ※サイドバーの開閉ボタン（stSidebarCollapseButton / stSidebarCollapsedControl）と
+   ヘッダーは隠さないこと。隠すと畳んだサイドバーを戻せなくなる */
 #MainMenu        {display: none !important;}
 footer           {display: none !important;}
-[data-testid="stDeployButton"]   {display: none !important;}
+[data-testid="stDeployButton"]    {display: none !important;}
+[data-testid="stAppDeployButton"] {display: none !important;}
 [data-testid="stStatusWidget"]   {display: none !important;}
-[data-testid="stToolbar"]        {display: none !important;}
+[data-testid="stMainMenu"]       {display: none !important;}
 
-/* デスクトップ：ヘッダー非表示、サイドバー常時表示 */
-@media (min-width: 641px) {
-    header {display: none !important;}
-    [data-testid="stSidebar"] {
-        transform: translateX(0) !important;
-        min-width: 244px !important;
-        width: 244px !important;
-        display: block !important;
-    }
-    [data-testid="stSidebarCollapseButton"]   {display: none !important;}
-    [data-testid="stSidebarCollapsedControl"] {display: none !important;}
+/* ヘッダーは開閉ボタンの置き場所として残しつつ、目立たなくする */
+header[data-testid="stHeader"] {
+    background: transparent !important;
 }
 /* データエディタの列ヘッダーメニューを非表示 */
 .ag-header-cell-menu-button      {display: none !important;}
@@ -185,6 +185,58 @@ def load_delivery_months() -> dict[str, int]:
     return dict(sorted(month_counts.items(), reverse=True))
 
 
+# ── 取込履歴一覧（ファイル単位取消用） ────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_import_batches() -> list[dict] | None:
+    """取込履歴を新しい順に返す。テーブル未作成なら None"""
+    try:
+        res = (
+            get_supabase().table("import_batches")
+            .select("*")
+            .order("imported_at", desc=True)
+            .execute()
+        )
+        return res.data
+    except Exception:
+        return None
+
+
+# ── ログイン保持（Cookie） ─────────────────────────────────────────────────────
+AUTH_COOKIE = "keiyakuzan_auth"
+AUTH_DAYS = 30
+
+
+def _auth_secret() -> bytes:
+    """トークン署名用の秘密鍵（既存のシークレットから導出、追加設定不要）"""
+    raw = st.secrets["SUPABASE_KEY"] + st.secrets.get("APP_PASSWORD", "")
+    return raw.encode()
+
+
+def _make_auth_token() -> str:
+    """有効期限つき署名トークン: "<期限unix秒>.<HMAC署名>" """
+    expiry = int(time.time()) + AUTH_DAYS * 24 * 3600
+    sig = hmac.new(_auth_secret(), str(expiry).encode(), hashlib.sha256).hexdigest()
+    return f"{expiry}.{sig}"
+
+
+def _verify_auth_token(token: str | None) -> bool:
+    if not token or "." not in token:
+        return False
+    expiry_s, sig = token.split(".", 1)
+    try:
+        expiry = int(expiry_s)
+    except ValueError:
+        return False
+    if time.time() > expiry:
+        return False
+    expected = hmac.new(_auth_secret(), expiry_s.encode(), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
+
+
+def get_cookie_manager() -> stx.CookieManager:
+    return stx.CookieManager(key="cookie_manager")
+
+
 # ── 認証画面 ──────────────────────────────────────────────────────────────────
 def show_login() -> None:
     _, col, _ = st.columns([1, 1.2, 1])
@@ -287,17 +339,36 @@ def page_contracts() -> None:
 
     st.markdown("---")
 
-    # ── フィルター（2×2グリッド） ─────────────────────────────────────────────
-    fc1, fc2 = st.columns(2)
-    with fc1:
-        f_seller     = st.text_input("🔍 販売店",  key="f_seller")
-        f_contractor = st.text_input("🔍 ゼネコン", key="f_contractor")
-    with fc2:
-        f_secondary  = st.text_input("🔍 二次店",  key="f_secondary")
-        f_field      = st.text_input("🔍 現場名",  key="f_field")
+    # ── 検索（1つの窓で全項目を横断検索） ────────────────────────────────────
+    f_query = st.text_input(
+        "🔍 検索",
+        key="f_query",
+        placeholder="販売店・二次店・ゼネコン・現場名・契約NO・備考 から検索",
+    )
+    with st.expander("詳細検索（項目別に絞り込み）"):
+        fc1, fc2 = st.columns(2)
+        with fc1:
+            f_seller     = st.text_input("販売店",  key="f_seller")
+            f_contractor = st.text_input("ゼネコン", key="f_contractor")
+        with fc2:
+            f_secondary  = st.text_input("二次店",  key="f_secondary")
+            f_field      = st.text_input("現場名",  key="f_field")
 
     # フィルタ適用
     filtered = df.copy()
+    if f_query:
+        search_cols = [
+            "seller", "secondary_seller", "general_contractor",
+            "field_name", "contract_no", "memo",
+        ]
+        mask = pd.Series(False, index=filtered.index)
+        for col in search_cols:
+            if col in filtered.columns:
+                mask |= (
+                    filtered[col].astype(str)
+                    .str.contains(f_query, case=False, na=False)
+                )
+        filtered = filtered[mask]
     if f_seller:
         filtered = filtered[
             filtered["seller"].str.contains(f_seller, case=False, na=False)
@@ -355,9 +426,18 @@ def page_contracts() -> None:
         "is_completed":       st.column_config.CheckboxColumn("✅ 完了"),
     }
 
-    editor_key = f"editor_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
+    editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
-    st.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
+    cap_col, dl_col = st.columns([4, 1])
+    cap_col.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
+    if not filtered.empty:
+        dl_col.download_button(
+            "📥 CSV出力",
+            data=_filtered_to_csv(filtered),
+            file_name=f"契約残一覧_{datetime.now():%Y%m%d}.csv",
+            mime="text/csv",
+            key="btn_csv_download",
+        )
 
     if df.empty:
         st.info("データがありません。まずCSV取込を行ってください。")
@@ -421,6 +501,31 @@ def page_contracts() -> None:
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
     _show_add_form(df, supabase)
+
+
+def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
+    """絞り込み結果を Excel でそのまま開ける CSV（CP932）に変換する"""
+    out = filtered.copy()
+    qty = pd.to_numeric(out["contract_qty"], errors="coerce")
+    shipped = pd.to_numeric(out["shipped_qty"], errors="coerce")
+    out["consumption_pct"] = (shipped / qty * 100).where(qty > 0).round(1)
+
+    cols = {
+        "contract_no":        "契約NO",
+        "seller":             "販売店",
+        "secondary_seller":   "二次店",
+        "general_contractor": "ゼネコン",
+        "field_name":         "現場名",
+        "contract_qty":       "契約数量(m3)",
+        "shipped_qty":        "出荷実績(m3)",
+        "remaining_qty":      "契約残(m3)",
+        "consumption_pct":    "消化率(%)",
+    }
+    if "memo" in out.columns:
+        cols["memo"] = "備考"
+    out = out[list(cols)].rename(columns=cols)
+    out = out.sort_values("契約残(m3)", ascending=False, na_position="last")
+    return out.to_csv(index=False).encode("cp932", errors="replace")
 
 
 def _render_view_table(filtered: pd.DataFrame) -> None:
@@ -621,6 +726,7 @@ def page_csv_import() -> None:
     parse_errors: list[str] = []
     all_deliveries: list[dict] = []
     contracts_info: dict[str, dict] = {}
+    batch_rows: list[dict] = []  # 取込履歴（ファイル単位の取消用）
 
     # ── ファイル読込フェーズ ──────────────────────────────────────────────────
     for i, f in enumerate(uploaded_files):
@@ -628,6 +734,8 @@ def page_csv_import() -> None:
             (i + 0.5) / len(uploaded_files),
             text=f"読込中: {f.name}",
         )
+        batch_id = str(uuid.uuid4())
+        rows_before = len(all_deliveries)
         raw = f.read()
 
         content: str | None = None
@@ -691,6 +799,7 @@ def page_csv_import() -> None:
                 "contract_no":   contract_no,
                 "slip_no":       slip_no,
                 "delivery_qty":  qty,
+                "batch_id":      batch_id,
             })
 
             if contract_no not in contracts_info:
@@ -705,6 +814,14 @@ def page_csv_import() -> None:
                     "seller":             seller,
                     "secondary_seller":   secondary,
                 }
+
+        file_count = len(all_deliveries) - rows_before
+        if file_count > 0:
+            batch_rows.append({
+                "id":           batch_id,
+                "filename":     f.name,
+                "record_count": file_count,
+            })
 
     if not all_deliveries:
         st.error("取込可能なデータがありませんでした")
@@ -776,6 +893,16 @@ def page_csv_import() -> None:
                     f"契約UPDATE失敗 {info['contract_no']}: {e}"
                 )
 
+    # 取込履歴を登録（import_batches テーブル未作成ならスキップして従来どおり動作）
+    batches_supported = True
+    if batch_rows:
+        try:
+            supabase.table("import_batches").insert(batch_rows).execute()
+        except Exception:
+            batches_supported = False
+            for d in all_deliveries:
+                d.pop("batch_id", None)
+
     # deliveries を UPSERT（200件/バッチ、0.3秒インターバル）
     valid_deliveries = [
         d for d in all_deliveries if d["contract_no"] not in failed_contracts
@@ -809,12 +936,20 @@ def page_csv_import() -> None:
             f"⚠️ {skipped_count}件の出荷レコードがスキップされました"
             f"（契約INSERT失敗）"
         )
+    if not batches_supported:
+        st.info(
+            "ℹ️ 取込履歴テーブルが未作成のため、ファイル単位の取消は記録されませんでした。"
+            "有効にするには migration_add_import_batches.sql を "
+            "Supabase の SQL Editor で実行してください。"
+        )
     if parse_errors:
         with st.expander(f"⚠️ エラー・警告（{len(parse_errors)}件）"):
             for e in parse_errors:
                 st.write(f"- {e}")
 
     load_data.clear()
+    load_delivery_months.clear()
+    load_import_batches.clear()
 
 
 # ── データ管理ヘルパー ─────────────────────────────────────────────────────────
@@ -847,6 +982,11 @@ def _delete_months_and_orphans(supabase: Client, months: list[str]) -> int:
             "delivery_date", f"{ym}-01"
         ).lt("delivery_date", next_ym).execute()
 
+    return _delete_orphans_among(supabase, affected)
+
+
+def _delete_orphans_among(supabase: Client, affected: set[str]) -> int:
+    """指定契約のうち、出荷実績が残っていないものを削除する。削除件数を返す。"""
     if not affected:
         return 0
 
@@ -868,6 +1008,32 @@ def _delete_months_and_orphans(supabase: Client, months: list[str]) -> int:
         ).execute()
 
     return len(orphans)
+
+
+def _delete_batch_and_orphans(supabase: Client, batch_id: str) -> tuple[int, int]:
+    """取込バッチ1件分の出荷実績を削除し、孤立した契約も削除する。
+    （削除した出荷レコード数, 削除した契約数）を返す。"""
+    # 対象バッチの contract_no と件数を取得
+    affected: set[str] = set()
+    deleted_rows = 0
+    offset = 0
+    while True:
+        res = (
+            supabase.table("deliveries").select("contract_no")
+            .eq("batch_id", batch_id)
+            .range(offset, offset + 999).execute()
+        )
+        for row in res.data:
+            affected.add(row["contract_no"])
+        deleted_rows += len(res.data)
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+
+    supabase.table("deliveries").delete().eq("batch_id", batch_id).execute()
+    orphan_count = _delete_orphans_among(supabase, affected)
+    supabase.table("import_batches").delete().eq("id", batch_id).execute()
+    return deleted_rows, orphan_count
 
 
 def _count_orphan_contracts(supabase: Client) -> int:
@@ -938,6 +1104,35 @@ def page_data_management() -> None:
     st.header("データ管理")
     supabase = get_supabase()
 
+    # ── 取込バッチ取消確認ダイアログ（優先表示） ────────────────────────────
+    if "pending_batch_delete" in st.session_state:
+        batch: dict = st.session_state["pending_batch_delete"]
+        st.warning(
+            f"⚠️ 取込ファイル **{batch['filename']}**"
+            f"（{batch['record_count']:,}件）の出荷実績を取り消します。\n\n"
+            "このファイルで取り込んだ出荷実績が削除され、"
+            "出荷実績がなくなった契約も契約残一覧から自動削除されます。\n"
+            "この操作は取り消せません。"
+        )
+        col1, col2, _ = st.columns([1, 1, 5])
+        with col1:
+            if st.button("🗑️ 取り消す", type="primary", key="btn_confirm_batch_delete"):
+                rows, orphans = _delete_batch_and_orphans(supabase, batch["id"])
+                st.session_state.pop("pending_batch_delete", None)
+                load_import_batches.clear()
+                load_delivery_months.clear()
+                load_data.clear()
+                st.success(
+                    f"✅ {batch['filename']} の取込を取り消しました"
+                    f"（出荷実績 {rows:,}件、関連契約 {orphans:,}件 を削除）"
+                )
+                st.rerun()
+        with col2:
+            if st.button("キャンセル", key="btn_cancel_batch_delete"):
+                st.session_state.pop("pending_batch_delete", None)
+                st.rerun()
+        return
+
     # ── 月削除確認ダイアログ（優先表示） ────────────────────────────────────
     if "pending_month_delete" in st.session_state:
         months: list[str] = st.session_state["pending_month_delete"]
@@ -985,6 +1180,34 @@ def page_data_management() -> None:
                 st.session_state.pop("pending_orphan_delete", None)
                 st.rerun()
         return
+
+    # ── 取込履歴（ファイル単位） ──────────────────────────────────────────────
+    st.subheader("取込履歴（ファイル単位）")
+    batches = load_import_batches()
+    if batches is None:
+        st.caption(
+            "ファイル単位の取消を使うには、`migration_add_import_batches.sql` を "
+            "Supabase の SQL Editor で1回実行してください（実行するまでは月別削除のみ使えます）。"
+        )
+    elif not batches:
+        st.caption("取込履歴はまだありません。次回のCSV取込から記録されます。")
+    else:
+        st.caption("間違えて取り込んだファイルを、ファイル単位で取り消せます。")
+        for b in batches:
+            try:
+                dt = dateutil_parser.parse(b["imported_at"]).astimezone()
+                when = f"{dt:%Y/%m/%d %H:%M}"
+            except Exception:
+                when = str(b["imported_at"])[:16]
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(
+                f"**{b['filename']}**　　{when} 取込　　{b['record_count']:,} 件"
+            )
+            if c2.button("取消", key=f"btn_undo_{b['id']}"):
+                st.session_state["pending_batch_delete"] = b
+                st.rerun()
+
+    st.markdown("---")
 
     # ── 取込済みデータ一覧 ────────────────────────────────────────────────────
     st.subheader("取込済み出荷実績（月別）")
@@ -1039,11 +1262,29 @@ def main() -> None:
     if "dark_mode" not in st.session_state:
         st.session_state.dark_mode = False
 
+    # Cookie によるログイン保持（30日）
+    cookie_mgr = get_cookie_manager()
+    cookies = cookie_mgr.get_all(key="cookies_init") or {}
+    cookie_token = cookies.get(AUTH_COOKIE)
+
+    if not st.session_state.get("authenticated", False):
+        if _verify_auth_token(cookie_token):
+            st.session_state.authenticated = True
+
     if not st.session_state.get("authenticated", False):
         if st.session_state.dark_mode:
             st.markdown(DARK_MODE_CSS, unsafe_allow_html=True)
         show_login()
         st.stop()
+
+    # ログイン済みなのに有効な Cookie がなければ書き込む（書込失敗時も次回実行で再試行される）
+    if not _verify_auth_token(cookie_token):
+        cookie_mgr.set(
+            AUTH_COOKIE,
+            _make_auth_token(),
+            expires_at=datetime.now() + timedelta(days=AUTH_DAYS),
+            key="cookie_set_auth",
+        )
 
     with st.sidebar:
         st.markdown("## 🏗️ 生コン契約残管理\n**中央コンクリート**")
@@ -1058,6 +1299,8 @@ def main() -> None:
         st.markdown("---")
         if st.button("ログアウト", key="btn_logout"):
             st.session_state.authenticated = False
+            cookie_mgr.delete(AUTH_COOKIE, key="cookie_del_auth")
+            time.sleep(0.4)  # Cookie削除が画面側で処理されるのを待つ
             st.rerun()
 
     if st.session_state.dark_mode:
