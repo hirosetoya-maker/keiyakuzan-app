@@ -591,7 +591,7 @@ def page_contracts() -> None:
     edit_mode = st.toggle("✏️ 編集モード（契約数量・備考の修正、完了削除）", key="edit_mode")
 
     if not edit_mode:
-        _render_view_table(sorted_df)
+        _render_view_table(sorted_df, supabase)
         st.markdown("---")
         _show_add_form(df, supabase)
         return
@@ -642,8 +642,7 @@ def page_contracts() -> None:
     if save_edits:
         _handle_save(display_df, save_edits, supabase)
 
-    # ── 詳細編集（JV・日付・単価） ────────────────────────────────────────────
-    _show_detail_editor(filtered, supabase)
+    st.caption("💡 JVの変更は閲覧モードに切り替えて、現場の行をクリックすると編集できます")
 
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
@@ -1108,8 +1107,9 @@ tr {{ page-break-inside: avoid; }}
 </body></html>"""
 
 
-def _render_view_table(filtered: pd.DataFrame) -> None:
-    """閲覧モード：色強調・消化率バー・並び替え可能な読み取り専用テーブル"""
+def _render_view_table(filtered: pd.DataFrame, supabase: Client) -> None:
+    """閲覧モード：色強調・消化率バー・並び替え可能なテーブル。
+    行をクリックすると詳細編集ダイアログ（JV・日付・単価）が開く。"""
     view_df = filtered.copy()
 
     # 消化率（%）。契約数量が未設定・0 の行は計算不可なので空欄
@@ -1193,7 +1193,10 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
 
     styler = view_df.style.apply(_row_style, axis=1)
 
-    st.dataframe(
+    # 行クリックで詳細編集を開けるよう、選択イベントを有効化。
+    # 保存後に選択状態をリセットするため key にノンスを含める
+    nonce = st.session_state.setdefault("view_nonce", 0)
+    event = st.dataframe(
         styler,
         column_config={
             "contract_no":        st.column_config.TextColumn("契約NO", width="small"),
@@ -1226,8 +1229,26 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
         use_container_width=True,
         hide_index=True,
         height=600,
+        key=f"view_table_{nonce}",
+        on_select="rerun",
+        selection_mode="single-row",
     )
-    st.caption("🟨 黄色の行＝契約残が50%以上（出荷が進んでいない要注意現場）　／　列見出しをクリックすると並び替えできます")
+    st.caption(
+        "🟨 黄色の行＝契約残が50%以上（出荷が進んでいない要注意現場）　／　"
+        "行をクリックすると詳細編集（JV・契約日・着工日・単価）が開きます　／　"
+        "列見出しクリックで並び替え"
+    )
+
+    # 行が選択されたら詳細編集ダイアログを開く（同じ選択での再オープンは防ぐ）
+    sel_rows = event.selection.rows if event and event.selection else []
+    if sel_rows:
+        sel_id = (nonce, sel_rows[0])
+        if st.session_state.get("detail_handled") != sel_id:
+            st.session_state["detail_handled"] = sel_id
+            _detail_dialog(filtered.iloc[sel_rows[0]].to_dict(), supabase)
+    else:
+        # 選択解除されたらガードもリセット（同じ行をもう一度開けるように）
+        st.session_state.pop("detail_handled", None)
 
 
 def _handle_save(
@@ -1325,31 +1346,11 @@ def _detail_dialog(row: dict, supabase: Client) -> None:
             "unit_price":    float(new_price) if new_price is not None else None,
         }).eq("contract_no", str(row["contract_no"])).execute()
         load_data.clear()
+        # 行選択をリセットしてからリラン（しないと保存後にダイアログが再オープンする）
+        st.session_state["view_nonce"] = st.session_state.get("view_nonce", 0) + 1
+        st.session_state.pop("detail_handled", None)
         st.session_state["autosaved_count"] = 1
         st.rerun()
-
-
-def _show_detail_editor(filtered: pd.DataFrame, supabase: Client) -> None:
-    """編集モード用：契約を選んで詳細編集ダイアログを開くUI"""
-    with st.expander("📝 詳細編集（JV・契約日・着工日・単価）", expanded=False):
-        if filtered.empty:
-            st.caption("対象の契約がありません。")
-            return
-        labels = {
-            f"{r['contract_no']}｜{r['field_name']}": i
-            for i, r in filtered.iterrows()
-        }
-        choice = st.selectbox(
-            "編集する契約を選択",
-            list(labels),
-            index=None,
-            placeholder="契約NOまたは現場名で選ぶ（上の検索で絞り込むと探しやすい）",
-            key="detail_pick",
-        )
-        if choice is not None:
-            if st.button("✏️ 編集ダイアログを開く", key="btn_detail_open"):
-                row = filtered.loc[labels[choice]].to_dict()
-                _detail_dialog(row, supabase)
 
 
 def _show_add_form(existing_df: pd.DataFrame, supabase: Client) -> None:
