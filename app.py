@@ -199,6 +199,43 @@ def load_delivery_months() -> dict[str, int]:
     return dict(sorted(month_counts.items(), reverse=True))
 
 
+# ── 月別出荷量（サマリー印刷用） ──────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def load_monthly_shipments() -> list[tuple[str, float]]:
+    """(年月, 出荷量合計) のリストを古い順に返す"""
+    supabase = get_supabase()
+
+    # ビューに sum_qty 列があればそれを使う（高速）
+    try:
+        res = supabase.table("delivery_month_counts").select("*").execute()
+        if res.data and "sum_qty" in res.data[0]:
+            return sorted(
+                (row["ym"], float(row["sum_qty"] or 0)) for row in res.data
+            )
+    except Exception:
+        pass
+
+    # フォールバック: 全行を取得して集計
+    rows = []
+    offset = 0
+    while True:
+        res = (
+            supabase.table("deliveries")
+            .select("delivery_date,delivery_qty")
+            .range(offset, offset + 999)
+            .execute()
+        )
+        rows.extend(res.data)
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+    agg: dict[str, float] = {}
+    for r in rows:
+        ym = str(r["delivery_date"])[:7]
+        agg[ym] = agg.get(ym, 0.0) + float(r["delivery_qty"] or 0)
+    return sorted(agg.items())
+
+
 # ── 取込履歴一覧（ファイル単位取消用） ────────────────────────────────────────
 @st.cache_data(ttl=60)
 def load_import_batches() -> list[dict] | None:
@@ -335,24 +372,6 @@ def page_contracts() -> None:
     # ── データ読込 ────────────────────────────────────────────────────────────
     df = load_data()
 
-    # ── KPIカード ──────────────────────────────────────────────────────────────
-    total_count = len(df)
-    qty_series = df["contract_qty"].dropna() if total_count > 0 else pd.Series(dtype=float)
-    rem_series  = df["remaining_qty"].dropna() if total_count > 0 else pd.Series(dtype=float)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("契約件数", f"{total_count:,} 件")
-    c2.metric(
-        "契約数量合計",
-        f"{qty_series.sum():,.1f} m³" if len(qty_series) > 0 else "－",
-    )
-    c3.metric(
-        "契約残合計",
-        f"{rem_series.sum():,.1f} m³" if len(rem_series) > 0 else "－",
-    )
-
-    st.markdown("---")
-
     # ── 検索（1つの窓で全項目を横断検索） ────────────────────────────────────
     f_query = st.text_input(
         "🔍 検索",
@@ -407,6 +426,32 @@ def page_contracts() -> None:
         .reset_index(drop=True)
     )
 
+    # ── KPIカード（絞り込みに連動） ──────────────────────────────────────────
+    total_count = len(df)
+    is_filtering = len(filtered) != total_count
+    suffix = "（絞り込み）" if is_filtering else ""
+    qty_series = (
+        filtered["contract_qty"].dropna() if not filtered.empty
+        else pd.Series(dtype=float)
+    )
+    rem_series = (
+        filtered["remaining_qty"].dropna() if not filtered.empty
+        else pd.Series(dtype=float)
+    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"契約件数{suffix}", f"{len(filtered):,} 件")
+    c2.metric(
+        f"契約数量合計{suffix}",
+        f"{qty_series.sum():,.1f} m³" if len(qty_series) > 0 else "－",
+    )
+    c3.metric(
+        f"契約残合計{suffix}",
+        f"{rem_series.sum():,.1f} m³" if len(rem_series) > 0 else "－",
+    )
+
+    st.markdown("---")
+
     # ── テーブル表示用 DataFrame ─────────────────────────────────────────────
     memo_col = "memo" if "memo" in filtered.columns else None
     display_cols = [
@@ -442,8 +487,8 @@ def page_contracts() -> None:
 
     editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
-    cap_col, sort_col, pr_col, dl_col = st.columns(
-        [2.4, 1.6, 0.8, 1.0], vertical_alignment="bottom"
+    cap_col, sort_col, dash_col, pr_col, dl_col = st.columns(
+        [1.9, 1.6, 1.1, 1.0, 1.0], vertical_alignment="bottom"
     )
     cap_col.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
     sort_label = sort_col.selectbox(
@@ -453,6 +498,12 @@ def page_contracts() -> None:
         help="ここで選んだ並び順が、画面の表だけでなく印刷した紙とCSV出力にもそのまま使われます",
     )
     sorted_df = _apply_sort(filtered, sort_label)
+    if not df.empty:
+        with dash_col:
+            components.html(
+                _dashboard_component_html(df, load_monthly_shipments()),
+                height=44,
+            )
     if not filtered.empty:
         with pr_col:
             components.html(
@@ -584,6 +635,238 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
     return out.to_csv(index=False).encode("cp932", errors="replace")
 
 
+# ── サマリー印刷（A4縦ダッシュボード） ────────────────────────────────────────
+# 白黒印刷でも見分けられる濃淡（濃い→薄い、最後の灰色は「その他」用）
+PIE_COLORS = ["#1e3a5f", "#3f6491", "#7a9cc4", "#b3c7de", "#dde7f1", "#c4c4c4"]
+
+
+def _pie_svg(items: list[tuple[str, float, float]], size: int = 150) -> str:
+    """(ラベル, 値, 全体比%) のリストから円グラフSVGを作る"""
+    import math
+
+    total = sum(v for _, v, _ in items)
+    if total <= 0:
+        return "<div style='color:#888;font-size:9pt;'>データなし</div>"
+
+    cx = cy = size / 2
+    radius = size / 2 - 4
+    paths = []
+    angle = -90.0  # 12時の位置から時計回り
+    for i, (_, value, _) in enumerate(items):
+        frac = value / total
+        if frac <= 0:
+            continue
+        start, end = angle, angle + frac * 360
+        angle = end
+        color = PIE_COLORS[min(i, len(PIE_COLORS) - 1)]
+        if frac >= 0.9999:  # 1社のみの場合は円
+            paths.append(
+                f"<circle cx='{cx}' cy='{cy}' r='{radius}' fill='{color}' "
+                f"stroke='white' stroke-width='1'/>"
+            )
+            continue
+        x1 = cx + radius * math.cos(math.radians(start))
+        y1 = cy + radius * math.sin(math.radians(start))
+        x2 = cx + radius * math.cos(math.radians(end))
+        y2 = cy + radius * math.sin(math.radians(end))
+        large = 1 if (end - start) > 180 else 0
+        paths.append(
+            f"<path d='M{cx},{cy} L{x1:.1f},{y1:.1f} "
+            f"A{radius},{radius} 0 {large} 1 {x2:.1f},{y2:.1f} Z' "
+            f"fill='{color}' stroke='white' stroke-width='1'/>"
+        )
+    return (
+        f"<svg width='{size}' height='{size}' viewBox='0 0 {size} {size}' "
+        f"xmlns='http://www.w3.org/2000/svg'>{''.join(paths)}</svg>"
+    )
+
+
+def _bar_svg(months: list[tuple[str, float]], width: int = 660, height: int = 150) -> str:
+    """(年月, 出荷量) のリストから棒グラフSVGを作る"""
+    if not months:
+        return "<div style='color:#888;font-size:9pt;'>出荷データなし</div>"
+
+    max_v = max(v for _, v in months) or 1
+    pad_b, pad_t = 26, 16
+    plot_h = height - pad_b - pad_t
+    n = len(months)
+    slot = width / n
+    bar_w = min(slot * 0.6, 48)
+    parts = []
+    for i, (ym, v) in enumerate(months):
+        h = plot_h * v / max_v
+        x = i * slot + (slot - bar_w) / 2
+        y = pad_t + plot_h - h
+        label = f"{int(ym[2:4])}/{int(ym[5:7])}"  # "26/4"
+        parts.append(
+            f"<rect x='{x:.1f}' y='{y:.1f}' width='{bar_w:.1f}' height='{h:.1f}' "
+            f"fill='#3f6491'/>"
+            f"<text x='{x + bar_w / 2:.1f}' y='{y - 4:.1f}' text-anchor='middle' "
+            f"font-size='9' fill='#333'>{v:,.0f}</text>"
+            f"<text x='{x + bar_w / 2:.1f}' y='{height - 10}' text-anchor='middle' "
+            f"font-size='10' fill='#333'>{label}</text>"
+        )
+    return (
+        f"<svg width='{width}' height='{height}' viewBox='0 0 {width} {height}' "
+        f"xmlns='http://www.w3.org/2000/svg'>{''.join(parts)}</svg>"
+    )
+
+
+def _ranking_section(
+    grouped: pd.DataFrame, metric: str, title: str, note: str
+) -> str:
+    """二次店TOP5の1セクション（円グラフ＋表）のHTMLを作る"""
+    total = float(grouped[metric].sum())
+    top = grouped.sort_values(metric, ascending=False).head(5)
+    top = top[top[metric] > 0]
+    if top.empty or total <= 0:
+        return (
+            f"<div class='section'><h2>{html_mod.escape(title)}</h2>"
+            "<div style='color:#888;font-size:9pt;'>データなし</div></div>"
+        )
+
+    others = total - float(top[metric].sum())
+    pie_items = [
+        (str(name), float(row[metric]), float(row[metric]) / total * 100)
+        for name, row in top.iterrows()
+    ]
+    if others > 0.05:
+        pie_items.append(("その他", others, others / total * 100))
+
+    rows_html = []
+    for i, (name, value, share) in enumerate(pie_items):
+        color = PIE_COLORS[min(i, len(PIE_COLORS) - 1)]
+        if name == "その他":
+            qty_s = shipped_s = rem_s = "－"
+        else:
+            g = grouped.loc[name]
+            qty_s = f"{g['contract_qty']:,.1f}"
+            shipped_s = f"{g['shipped_qty']:,.1f}"
+            rem_s = f"{g['remaining_qty']:,.1f}"
+        rows_html.append(
+            "<tr>"
+            f"<td><span class='chip' style='background:{color}'></span>"
+            f"{html_mod.escape(name)}</td>"
+            f"<td class='r'>{qty_s}</td>"
+            f"<td class='r'>{shipped_s}</td>"
+            f"<td class='r'>{rem_s}</td>"
+            f"<td class='r'><b>{share:.1f}%</b></td>"
+            "</tr>"
+        )
+
+    return f"""
+<div class='section'>
+<h2>{html_mod.escape(title)}</h2>
+<div class='flexrow'>
+<div>{_pie_svg(pie_items)}</div>
+<table class='rank'>
+<thead><tr><th>二次店</th><th>契約数量<br>(m³)</th><th>出荷実績<br>(m³)</th>
+<th>契約残<br>(m³)</th><th>{html_mod.escape(note)}</th></tr></thead>
+<tbody>{''.join(rows_html)}</tbody>
+</table>
+</div>
+</div>"""
+
+
+def _dashboard_component_html(
+    df: pd.DataFrame, months: list[tuple[str, float]]
+) -> str:
+    """サマリー印刷ボタン＋A4縦ダッシュボードのHTML（全データ集計）"""
+    qty = pd.to_numeric(df["contract_qty"], errors="coerce")
+    shipped = pd.to_numeric(df["shipped_qty"], errors="coerce")
+    rem = pd.to_numeric(df["remaining_qty"], errors="coerce")
+    over = (shipped - qty).where(qty > 0).clip(lower=0)
+    warn_count = int(((qty > 0) & (rem / qty >= 0.5)).sum())
+
+    kpis = [
+        ("契約件数", f"{len(df):,} 件"),
+        ("契約数量合計", f"{qty.sum():,.1f} m³"),
+        ("出荷実績合計", f"{shipped.sum():,.1f} m³"),
+        ("契約残合計", f"{rem.sum():,.1f} m³"),
+        ("超過出荷合計", f"{over.sum():,.1f} m³"),
+        ("要注意現場（残50%以上）", f"{warn_count:,} 件"),
+    ]
+    kpi_html = "".join(
+        f"<div class='kpi'><div class='kpi-label'>{html_mod.escape(k)}</div>"
+        f"<div class='kpi-value'>{html_mod.escape(v)}</div></div>"
+        for k, v in kpis
+    )
+
+    # 二次店別の集計（空欄は「（二次店なし）」に寄せる）
+    g = df.copy()
+    g["secondary_seller"] = (
+        g["secondary_seller"].replace("", "（二次店なし）").fillna("（二次店なし）")
+    )
+    for c in ("contract_qty", "shipped_qty", "remaining_qty"):
+        g[c] = pd.to_numeric(g[c], errors="coerce").fillna(0.0)
+    grouped = g.groupby("secondary_seller")[
+        ["contract_qty", "shipped_qty", "remaining_qty"]
+    ].sum()
+
+    sections = (
+        _ranking_section(grouped, "remaining_qty",
+                         "契約残の多い二次店 TOP5", "契約残全体に占める割合")
+        + _ranking_section(grouped, "contract_qty",
+                           "契約数量の多い二次店 TOP5", "契約数量全体に占める割合")
+        + _ranking_section(grouped, "shipped_qty",
+                           "出荷実績の多い二次店 TOP5", "出荷実績全体に占める割合")
+    )
+
+    printed_at = f"{datetime.now():%Y/%m/%d %H:%M}"
+
+    return f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<style>
+@page {{ size: A4 portrait; margin: 12mm; }}
+* {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+body {{ margin: 0; font-family: "Yu Gothic", "Meiryo", sans-serif; }}
+#printable {{ display: none; }}
+#printbtn {{
+    width: 100%; padding: 0.5rem 0.75rem; cursor: pointer;
+    border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.5rem;
+    background: white; font-size: 14px; font-family: inherit;
+}}
+#printbtn:hover {{ border-color: #1e3a5f; color: #1e3a5f; }}
+@media print {{
+    #printbtn {{ display: none; }}
+    #printable {{ display: block; }}
+}}
+h1 {{ font-size: 16pt; margin: 0 0 1mm; }}
+h2 {{ font-size: 11pt; margin: 0 0 2mm; border-left: 4px solid #1e3a5f; padding-left: 2mm; }}
+.meta {{ font-size: 9pt; color: #555; margin-bottom: 4mm; }}
+.kpis {{ display: flex; flex-wrap: wrap; gap: 2mm; margin-bottom: 5mm; }}
+.kpi {{
+    flex: 1 1 30%; border: 0.5pt solid #bbb; border-radius: 2mm;
+    padding: 2mm 3mm; background: #f4f6f9;
+}}
+.kpi-label {{ font-size: 8pt; color: #555; }}
+.kpi-value {{ font-size: 13pt; font-weight: bold; }}
+.section {{ margin-bottom: 5mm; page-break-inside: avoid; }}
+.flexrow {{ display: flex; gap: 5mm; align-items: center; }}
+table.rank {{ border-collapse: collapse; font-size: 8.5pt; flex: 1; }}
+table.rank th, table.rank td {{ border: 0.3pt solid #999; padding: 1mm 1.5mm; }}
+table.rank th {{ background: #e8ecf0; text-align: center; }}
+table.rank td.r {{ text-align: right; }}
+.chip {{
+    display: inline-block; width: 8pt; height: 8pt;
+    border: 0.3pt solid #777; margin-right: 1.5mm; vertical-align: middle;
+}}
+</style></head>
+<body>
+<button id="printbtn" onclick="window.print()">📊 サマリー印刷</button>
+<div id="printable">
+<h1>生コン契約残サマリー</h1>
+<div class="meta">印刷日時：{printed_at}　／　全データ集計（絞り込みの影響を受けません）</div>
+<div class="kpis">{kpi_html}</div>
+{sections}
+<div class="section">
+<h2>月別出荷量の推移（m³）</h2>
+{_bar_svg(months)}
+</div>
+</div>
+</body></html>"""
+
+
 def _print_component_html(
     filtered: pd.DataFrame, total_count: int, sort_label: str
 ) -> str:
@@ -681,7 +964,7 @@ tr.total td {{ background: #e8ecf0; font-weight: bold; text-align: right; }}
 tr {{ page-break-inside: avoid; }}
 </style></head>
 <body>
-<button id="printbtn" onclick="window.print()">🖨️ 印刷</button>
+<button id="printbtn" onclick="window.print()">🖨️ 一覧印刷</button>
 <div id="printable">
 <h1>生コン契約残一覧</h1>
 <div class="meta">

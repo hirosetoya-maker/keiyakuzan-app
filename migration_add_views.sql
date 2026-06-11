@@ -5,11 +5,12 @@
 -- 　データ管理ページの表示が遅くなります）
 -- ============================================================
 
--- 1. 月別出荷件数（データ管理ページの月別一覧用）
+-- 1. 月別出荷件数・出荷量（データ管理ページの月別一覧＋サマリー印刷用）
 CREATE OR REPLACE VIEW delivery_month_counts AS
 SELECT
     to_char(delivery_date, 'YYYY-MM') AS ym,
-    COUNT(*)                          AS cnt
+    COUNT(*)                          AS cnt,
+    SUM(delivery_qty)                 AS sum_qty
 FROM deliveries
 GROUP BY 1;
 
