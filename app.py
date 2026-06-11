@@ -520,6 +520,14 @@ def page_contracts() -> None:
         display_df[col] = pd.to_datetime(
             display_df[col], errors="coerce"
         ).dt.date
+    # JV はセル内で複数選択できるようリスト型に変換
+    display_df["jv"] = display_df["jv"].map(_jv_to_list)
+    jv_master = load_jv_options()
+    # マスタ未作成でも、設定済みの値は選択肢に出す
+    jv_choices = list(dict.fromkeys(
+        (jv_master or [])
+        + [v for lst in display_df["jv"] for v in lst]
+    ))
     display_df["is_completed"] = False
 
     col_config = {
@@ -534,9 +542,10 @@ def page_contracts() -> None:
                                   "契約日", format="YYYY/MM/DD"),
         "start_date":         st.column_config.DateColumn(
                                   "着工日", format="YYYY/MM/DD"),
-        "jv":                 st.column_config.TextColumn(
-                                  "JV", disabled=True, width="small",
-                                  help="JVは下の「詳細編集」から変更します"),
+        "jv":                 st.column_config.MultiselectColumn(
+                                  "JV", options=jv_choices, width="medium",
+                                  help="セルをクリックすると複数選択できます。"
+                                       "選択肢の追加はデータ管理ページのJVマスタから"),
         "contract_qty":       st.column_config.NumberColumn(
                                   "契約数量（m³）", min_value=0, step=0.5),
         "shipped_qty":        st.column_config.NumberColumn(
@@ -632,8 +641,9 @@ def page_contracts() -> None:
             st.session_state["pending_delete"] = checked_for_delete
             st.rerun()
 
-    # 数量・備考・日付・単価の自動保存
-    EDITABLE = ("contract_qty", "memo", "contract_date", "start_date", "unit_price")
+    # 数量・備考・日付・単価・JVの自動保存
+    EDITABLE = ("contract_qty", "memo", "contract_date", "start_date",
+                "unit_price", "jv")
     save_edits = {
         idx: {k: v for k, v in changes.items() if k in EDITABLE}
         for idx, changes in edited_rows.items()
@@ -642,7 +652,6 @@ def page_contracts() -> None:
     if save_edits:
         _handle_save(display_df, save_edits, supabase)
 
-    st.caption("💡 JVの変更は閲覧モードに切り替えて、現場の行をクリックすると編集できます")
 
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
@@ -1277,6 +1286,10 @@ def _handle_save(
             is_null = v is None or (isinstance(v, float) and pd.isna(v))
             payload["unit_price"] = None if is_null else float(v)
 
+        if "jv" in changes:
+            v = changes["jv"]
+            payload["jv"] = ",".join(v) if isinstance(v, list) else (v or "")
+
         for date_col in ("contract_date", "start_date"):
             if date_col in changes:
                 v = changes[date_col]
@@ -1286,13 +1299,24 @@ def _handle_save(
             to_update.append({"contract_no": contract_no, **payload})
 
     if to_update:
+        errors = []
         for r in to_update:
             cn      = r["contract_no"]
             payload = {k: v for k, v in r.items() if k != "contract_no"}
-            supabase.table("contracts").update(payload).eq("contract_no", cn).execute()
+            try:
+                supabase.table("contracts").update(payload) \
+                    .eq("contract_no", cn).execute()
+            except Exception as e:
+                errors.append(f"契約NO {cn}: {e}")
         load_data.clear()
-        st.session_state["autosaved_count"] = len(to_update)
-        st.rerun()
+        if errors:
+            st.error(
+                "⚠️ 保存に失敗した行があります。少し時間をおいて、"
+                "もう一度入力し直してください。\n\n" + "\n\n".join(errors)
+            )
+        else:
+            st.session_state["autosaved_count"] = len(to_update)
+            st.rerun()
 
 
 @st.dialog("契約の詳細編集")
@@ -1339,12 +1363,19 @@ def _detail_dialog(row: dict, supabase: Client) -> None:
     )
 
     if st.button("💾 保存する", type="primary", use_container_width=True):
-        supabase.table("contracts").update({
-            "jv":            ",".join(new_jv),
-            "contract_date": str(new_cdate) if new_cdate else None,
-            "start_date":    str(new_sdate) if new_sdate else None,
-            "unit_price":    float(new_price) if new_price is not None else None,
-        }).eq("contract_no", str(row["contract_no"])).execute()
+        try:
+            supabase.table("contracts").update({
+                "jv":            ",".join(new_jv),
+                "contract_date": str(new_cdate) if new_cdate else None,
+                "start_date":    str(new_sdate) if new_sdate else None,
+                "unit_price":    float(new_price) if new_price is not None else None,
+            }).eq("contract_no", str(row["contract_no"])).execute()
+        except Exception as e:
+            st.error(
+                "⚠️ 保存に失敗しました。少し時間をおいて、"
+                f"もう一度お試しください。\n\n{e}"
+            )
+            return
         load_data.clear()
         # 行選択をリセットしてからリラン（しないと保存後にダイアログが再オープンする）
         st.session_state["view_nonce"] = st.session_state.get("view_nonce", 0) + 1
