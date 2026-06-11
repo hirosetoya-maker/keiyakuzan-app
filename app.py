@@ -142,16 +142,28 @@ def load_data() -> pd.DataFrame:
         return pd.DataFrame(
             columns=[
                 "contract_no", "field_name", "seller", "secondary_seller",
-                "general_contractor", "contract_qty", "memo", "shipped_qty", "remaining_qty",
+                "general_contractor", "contract_qty", "memo", "shipped_qty",
+                "remaining_qty", "contract_date", "start_date", "jv", "unit_price",
             ]
         )
 
     df = pd.DataFrame(all_rows)
+
+    # マイグレーション未実行でも動くよう、無い列はデフォルトで補う
+    for col, default in (
+        ("memo", ""), ("contract_date", None), ("start_date", None),
+        ("jv", ""), ("unit_price", None),
+    ):
+        if col not in df.columns:
+            df[col] = default
+
     df["contract_qty"] = pd.to_numeric(df["contract_qty"], errors="coerce")
     df["shipped_qty"] = pd.to_numeric(df["shipped_qty"], errors="coerce").fillna(0.0)
+    df["unit_price"] = pd.to_numeric(df["unit_price"], errors="coerce")
 
     # "nan" 文字列を空欄に統一
-    for col in ("seller", "secondary_seller", "general_contractor", "field_name", "memo"):
+    for col in ("seller", "secondary_seller", "general_contractor",
+                "field_name", "memo", "jv"):
         if col in df.columns:
             df[col] = df[col].replace("nan", "").fillna("")
 
@@ -197,6 +209,30 @@ def load_delivery_months() -> dict[str, int]:
             break
         offset += PAGE_SIZE
     return dict(sorted(month_counts.items(), reverse=True))
+
+
+# ── JV選択肢マスタ ────────────────────────────────────────────────────────────
+@st.cache_data(ttl=60)
+def load_jv_options() -> list[str] | None:
+    """JV選択肢を表示順で返す。テーブル未作成なら None"""
+    try:
+        res = (
+            get_supabase().table("jv_options")
+            .select("*")
+            .order("sort_order")
+            .order("name")
+            .execute()
+        )
+        return [row["name"] for row in res.data]
+    except Exception:
+        return None
+
+
+def _jv_to_list(jv: object) -> list[str]:
+    """カンマ区切りのJV文字列をリストに変換"""
+    if jv is None or pd.isna(jv) or str(jv).strip() == "":
+        return []
+    return [p.strip() for p in str(jv).split(",") if p.strip()]
 
 
 # ── 月別出荷量（サマリー印刷用） ──────────────────────────────────────────────
@@ -439,7 +475,13 @@ def page_contracts() -> None:
         else pd.Series(dtype=float)
     )
 
-    c1, c2, c3 = st.columns(3)
+    _price = pd.to_numeric(filtered["unit_price"], errors="coerce") \
+        if not filtered.empty else pd.Series(dtype=float)
+    _rem = pd.to_numeric(filtered["remaining_qty"], errors="coerce") \
+        if not filtered.empty else pd.Series(dtype=float)
+    sales_series = (_price * _rem).dropna()
+
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric(f"契約件数{suffix}", f"{len(filtered):,} 件")
     c2.metric(
         f"契約数量合計{suffix}",
@@ -449,6 +491,11 @@ def page_contracts() -> None:
         f"契約残合計{suffix}",
         f"{rem_series.sum():,.1f} m³" if len(rem_series) > 0 else "－",
     )
+    c4.metric(
+        f"見込み売上{suffix}",
+        f"{sales_series.sum():,.0f} 円" if len(sales_series) > 0 else "－",
+        help="単価 × 契約残の合計（単価が入力されている現場のみ）",
+    )
 
     st.markdown("---")
 
@@ -456,15 +503,23 @@ def page_contracts() -> None:
     memo_col = "memo" if "memo" in filtered.columns else None
     display_cols = [
         "contract_no", "seller", "secondary_seller", "general_contractor",
-        "field_name", "contract_qty", "shipped_qty", "remaining_qty",
+        "field_name", "contract_date", "start_date", "jv",
+        "contract_qty", "shipped_qty", "remaining_qty", "unit_price",
     ]
     if memo_col:
         display_cols.append("memo")
     display_df = filtered[display_cols].copy()
     # NaN を pandas nullable Float64 に変換（Arrow シリアライズ時の "None" 表示を防ぐ）
-    for col in ("contract_qty", "remaining_qty"):
+    for col in ("contract_qty", "remaining_qty", "unit_price"):
         if col in display_df.columns:
-            display_df[col] = display_df[col].astype("Float64")
+            display_df[col] = pd.to_numeric(
+                display_df[col], errors="coerce"
+            ).astype("Float64")
+    # 日付列はカレンダー編集できるよう date 型に変換
+    for col in ("contract_date", "start_date"):
+        display_df[col] = pd.to_datetime(
+            display_df[col], errors="coerce"
+        ).dt.date
     display_df["is_completed"] = False
 
     col_config = {
@@ -475,12 +530,21 @@ def page_contracts() -> None:
         "general_contractor": st.column_config.TextColumn("ゼネコン", disabled=True),
         "field_name":         st.column_config.TextColumn(
                                   "現場名", disabled=True, width="large"),
+        "contract_date":      st.column_config.DateColumn(
+                                  "契約日", format="YYYY/MM/DD"),
+        "start_date":         st.column_config.DateColumn(
+                                  "着工日", format="YYYY/MM/DD"),
+        "jv":                 st.column_config.TextColumn(
+                                  "JV", disabled=True, width="small",
+                                  help="JVは下の「詳細編集」から変更します"),
         "contract_qty":       st.column_config.NumberColumn(
                                   "契約数量（m³）", min_value=0, step=0.5),
         "shipped_qty":        st.column_config.NumberColumn(
                                   "出荷実績（m³）", format="%g", disabled=True),
         "remaining_qty":      st.column_config.NumberColumn(
                                   "契約残（m³）", disabled=True),
+        "unit_price":         st.column_config.NumberColumn(
+                                  "単価（円/m³）", min_value=0, step=100),
         "memo":               st.column_config.TextColumn("備考", width="medium"),
         "is_completed":       st.column_config.CheckboxColumn("✅ 完了"),
     }
@@ -568,14 +632,18 @@ def page_contracts() -> None:
             st.session_state["pending_delete"] = checked_for_delete
             st.rerun()
 
-    # 数量・備考の自動保存
+    # 数量・備考・日付・単価の自動保存
+    EDITABLE = ("contract_qty", "memo", "contract_date", "start_date", "unit_price")
     save_edits = {
-        idx: {k: v for k, v in changes.items() if k in ("contract_qty", "memo")}
+        idx: {k: v for k, v in changes.items() if k in EDITABLE}
         for idx, changes in edited_rows.items()
-        if any(k in ("contract_qty", "memo") for k in changes)
+        if any(k in EDITABLE for k in changes)
     }
     if save_edits:
         _handle_save(display_df, save_edits, supabase)
+
+    # ── 詳細編集（JV・日付・単価） ────────────────────────────────────────────
+    _show_detail_editor(filtered, supabase)
 
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
@@ -584,15 +652,17 @@ def page_contracts() -> None:
 
 # ── 並び替え（画面・印刷・CSVの3つに共通で効く） ───────────────────────────────
 SORT_OPTIONS: dict[str, tuple[str, bool]] = {
-    "契約残が多い順":   ("remaining_qty", False),
-    "契約残が少ない順": ("remaining_qty", True),
-    "消化率が低い順":   ("_sort_pct", True),
-    "消化率が高い順":   ("_sort_pct", False),
-    "超過が多い順":     ("_sort_over", False),
-    "二次店順":         ("secondary_seller", True),
-    "販売店順":         ("seller", True),
-    "ゼネコン順":       ("general_contractor", True),
-    "現場名順":         ("field_name", True),
+    "契約残が多い順":     ("remaining_qty", False),
+    "契約残が少ない順":   ("remaining_qty", True),
+    "消化率が低い順":     ("_sort_pct", True),
+    "消化率が高い順":     ("_sort_pct", False),
+    "超過が多い順":       ("_sort_over", False),
+    "見込み売上が多い順": ("_sort_sales", False),
+    "契約日が新しい順":   ("contract_date", False),
+    "二次店順":           ("secondary_seller", True),
+    "販売店順":           ("seller", True),
+    "ゼネコン順":         ("general_contractor", True),
+    "現場名順":           ("field_name", True),
 }
 
 
@@ -601,12 +671,17 @@ def _apply_sort(filtered: pd.DataFrame, sort_label: str) -> pd.DataFrame:
     df = filtered.copy()
     qty = pd.to_numeric(df["contract_qty"], errors="coerce")
     shipped = pd.to_numeric(df["shipped_qty"], errors="coerce")
+    rem = pd.to_numeric(df["remaining_qty"], errors="coerce")
+    price = pd.to_numeric(df["unit_price"], errors="coerce")
     df["_sort_pct"] = (shipped / qty).where(qty > 0)
     df["_sort_over"] = (shipped - qty).where(qty > 0).clip(lower=0)
+    df["_sort_sales"] = price * rem
 
     col, asc = SORT_OPTIONS.get(sort_label, ("remaining_qty", False))
     df = df.sort_values(col, ascending=asc, na_position="last")
-    return df.drop(columns=["_sort_pct", "_sort_over"]).reset_index(drop=True)
+    return df.drop(
+        columns=["_sort_pct", "_sort_over", "_sort_sales"]
+    ).reset_index(drop=True)
 
 
 def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
@@ -623,6 +698,9 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
         "secondary_seller":   "二次店",
         "general_contractor": "ゼネコン",
         "field_name":         "現場名",
+        "contract_date":      "契約日",
+        "start_date":         "着工日",
+        "jv":                 "JV",
         "contract_qty":       "契約数量(m3)",
         "shipped_qty":        "出荷実績(m3)",
         "remaining_qty":      "契約残(m3)",
@@ -681,29 +759,43 @@ def _pie_svg(items: list[tuple[str, float, float]], size: int = 150) -> str:
     )
 
 
-def _bar_svg(months: list[tuple[str, float]], width: int = 660, height: int = 150) -> str:
-    """(年月, 出荷量) のリストから棒グラフSVGを作る"""
+def _bar_svg(
+    months: list[tuple[str, float, float]], width: int = 660, height: int = 170
+) -> str:
+    """(年月, 出荷量, 新規契約量) のリストから2本棒グラフSVGを作る"""
     if not months:
-        return "<div style='color:#888;font-size:9pt;'>出荷データなし</div>"
+        return "<div style='color:#888;font-size:9pt;'>データなし</div>"
 
-    max_v = max(v for _, v in months) or 1
+    max_v = max(max(s, c) for _, s, c in months) or 1
     pad_b, pad_t = 26, 16
     plot_h = height - pad_b - pad_t
     n = len(months)
     slot = width / n
-    bar_w = min(slot * 0.6, 48)
+    bar_w = min(slot * 0.36, 36)
+    show_values = n <= 9  # 月数が多いと数値ラベルが重なるため省略
     parts = []
-    for i, (ym, v) in enumerate(months):
-        h = plot_h * v / max_v
-        x = i * slot + (slot - bar_w) / 2
-        y = pad_t + plot_h - h
+    for i, (ym, shipped, contracted) in enumerate(months):
+        cx_slot = i * slot + slot / 2
         label = f"{int(ym[2:4])}/{int(ym[5:7])}"  # "26/4"
+        for j, (v, color) in enumerate(
+            ((shipped, "#3f6491"), (contracted, "#c9d8ea"))
+        ):
+            h = plot_h * v / max_v
+            x = cx_slot - bar_w + j * bar_w
+            y = pad_t + plot_h - h
+            parts.append(
+                f"<rect x='{x:.1f}' y='{y:.1f}' width='{bar_w:.1f}' "
+                f"height='{h:.1f}' fill='{color}' stroke='#777' "
+                f"stroke-width='0.5'/>"
+            )
+            if show_values and v > 0:
+                parts.append(
+                    f"<text x='{x + bar_w / 2:.1f}' y='{y - 3:.1f}' "
+                    f"text-anchor='middle' font-size='8' fill='#333'>"
+                    f"{v:,.0f}</text>"
+                )
         parts.append(
-            f"<rect x='{x:.1f}' y='{y:.1f}' width='{bar_w:.1f}' height='{h:.1f}' "
-            f"fill='#3f6491'/>"
-            f"<text x='{x + bar_w / 2:.1f}' y='{y - 4:.1f}' text-anchor='middle' "
-            f"font-size='9' fill='#333'>{v:,.0f}</text>"
-            f"<text x='{x + bar_w / 2:.1f}' y='{height - 10}' text-anchor='middle' "
+            f"<text x='{cx_slot:.1f}' y='{height - 10}' text-anchor='middle' "
             f"font-size='10' fill='#333'>{label}</text>"
         )
     return (
@@ -777,6 +869,9 @@ def _dashboard_component_html(
     rem = pd.to_numeric(df["remaining_qty"], errors="coerce")
     over = (shipped - qty).where(qty > 0).clip(lower=0)
     warn_count = int(((qty > 0) & (rem / qty >= 0.5)).sum())
+    price = pd.to_numeric(df["unit_price"], errors="coerce")
+    sales_total = float((price * rem).dropna().sum())
+    sales_note = f"（約{sales_total / 10000:,.0f}万円）" if sales_total > 0 else ""
 
     kpis = [
         ("契約件数", f"{len(df):,} 件"),
@@ -785,6 +880,7 @@ def _dashboard_component_html(
         ("契約残合計", f"{rem.sum():,.1f} m³"),
         ("超過出荷合計", f"{over.sum():,.1f} m³"),
         ("要注意現場（残50%以上）", f"{warn_count:,} 件"),
+        ("見込み売上合計（単価×契約残）", f"{sales_total:,.0f} 円{sales_note}"),
     ]
     kpi_html = "".join(
         f"<div class='kpi'><div class='kpi-label'>{html_mod.escape(k)}</div>"
@@ -810,6 +906,27 @@ def _dashboard_component_html(
                            "契約数量の多い二次店 TOP5", "契約数量全体に占める割合")
         + _ranking_section(grouped, "shipped_qty",
                            "出荷実績の多い二次店 TOP5", "出荷実績全体に占める割合")
+    )
+
+    # 月別: 出荷量（出荷日ベース・確定値）＋ 新規契約量（契約日ベース）
+    cdates = pd.to_datetime(df["contract_date"], errors="coerce")
+    cq = pd.to_numeric(df["contract_qty"], errors="coerce").fillna(0.0)
+    contracted_by_month = (
+        pd.DataFrame({"ym": cdates.dt.strftime("%Y-%m"), "q": cq})
+        .dropna(subset=["ym"])
+        .groupby("ym")["q"].sum().to_dict()
+    )
+    no_date_count = int((cdates.isna() & (cq > 0)).sum())
+    shipped_map = dict(months)
+    all_ym = sorted(set(shipped_map) | set(contracted_by_month))
+    combined = [
+        (ym, float(shipped_map.get(ym, 0.0)),
+         float(contracted_by_month.get(ym, 0.0)))
+        for ym in all_ym
+    ]
+    date_note = (
+        f"※契約日未入力の契約（数量あり {no_date_count:,}件）は新規契約量に含まれません"
+        if no_date_count > 0 else ""
     )
 
     printed_at = f"{datetime.now():%Y/%m/%d %H:%M}"
@@ -860,8 +977,13 @@ table.rank td.r {{ text-align: right; }}
 <div class="kpis">{kpi_html}</div>
 {sections}
 <div class="section">
-<h2>月別出荷量の推移（m³）</h2>
-{_bar_svg(months)}
+<h2>月別推移（m³）</h2>
+<div style="font-size:8.5pt; margin-bottom:1.5mm;">
+<span class='chip' style='background:#3f6491'></span>出荷量（出荷日ベース）
+<span class='chip' style='background:#c9d8ea'></span>新規契約量（契約日ベース）
+<span style="color:#777; margin-left:3mm;">{date_note}</span>
+</div>
+{_bar_svg(combined)}
 </div>
 </div>
 </body></html>"""
@@ -1005,14 +1127,36 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
     _shipped = pd.to_numeric(view_df["shipped_qty"], errors="coerce")
     view_df["overage_qty"] = (_shipped - _qty).where(_qty > 0).clip(lower=0)
 
+    # 見込み売上 = 単価 × 契約残
+    _price = pd.to_numeric(view_df["unit_price"], errors="coerce")
+    _rem = pd.to_numeric(view_df["remaining_qty"], errors="coerce")
+    view_df["expected_sales"] = _price * _rem
+
     view_cols = [
         "contract_no", "seller", "secondary_seller", "general_contractor",
-        "field_name", "contract_qty", "shipped_qty", "remaining_qty",
-        "overage_qty", "consumption_pct",
+        "field_name", "contract_date", "start_date", "jv",
+        "contract_qty", "shipped_qty", "remaining_qty",
+        "overage_qty", "consumption_pct", "unit_price", "expected_sales",
     ]
     if "memo" in view_df.columns:
         view_cols.append("memo")
     view_df = view_df[view_cols]
+
+    # 日付は "2026/06/11" 形式の文字列に（未入力は空欄）
+    def _fmt_date(v):
+        s = "" if v is None else str(v)
+        return "" if s in ("", "nan", "None", "NaT") else s[:10].replace("-", "/")
+
+    for c in ("contract_date", "start_date"):
+        view_df[c] = view_df[c].map(_fmt_date)
+
+    # 金額（円・桁区切り、未入力は空欄）
+    def _fmt_yen(v):
+        v = pd.to_numeric(v, errors="coerce")
+        return "" if pd.isna(v) else f"{float(v):,.0f}"
+
+    view_df["unit_price"] = view_df["unit_price"].map(_fmt_yen)
+    view_df["expected_sales"] = view_df["expected_sales"].map(_fmt_yen)
 
     view_df["consumption_pct"] = pd.to_numeric(
         view_df["consumption_pct"], errors="coerce"
@@ -1057,6 +1201,9 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
             "secondary_seller":   st.column_config.TextColumn("二次店", width="small"),
             "general_contractor": st.column_config.TextColumn("ゼネコン", width="medium"),
             "field_name":         st.column_config.TextColumn("現場名", width="large"),
+            "contract_date":      st.column_config.TextColumn("契約日", width="small"),
+            "start_date":         st.column_config.TextColumn("着工日", width="small"),
+            "jv":                 st.column_config.TextColumn("JV", width="small"),
             "contract_qty":       st.column_config.TextColumn(
                                       "契約数量（m³）", width="small", alignment="right"),
             "shipped_qty":        st.column_config.TextColumn(
@@ -1069,6 +1216,11 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
             "consumption_pct":    st.column_config.ProgressColumn(
                                       "消化率", format="%.0f%%",
                                       min_value=0, max_value=100),
+            "unit_price":         st.column_config.TextColumn(
+                                      "単価（円/m³）", width="small", alignment="right"),
+            "expected_sales":     st.column_config.TextColumn(
+                                      "見込み売上（円）", width="small", alignment="right",
+                                      help="単価 × 契約残。単価が未入力の現場は空欄"),
             "memo":               st.column_config.TextColumn("備考", width="medium"),
         },
         use_container_width=True,
@@ -1099,6 +1251,16 @@ def _handle_save(
         if "memo" in changes:
             payload["memo"] = changes["memo"] or ""
 
+        if "unit_price" in changes:
+            v = changes["unit_price"]
+            is_null = v is None or (isinstance(v, float) and pd.isna(v))
+            payload["unit_price"] = None if is_null else float(v)
+
+        for date_col in ("contract_date", "start_date"):
+            if date_col in changes:
+                v = changes[date_col]
+                payload[date_col] = str(v)[:10] if v else None
+
         if payload:
             to_update.append({"contract_no": contract_no, **payload})
 
@@ -1110,6 +1272,84 @@ def _handle_save(
         load_data.clear()
         st.session_state["autosaved_count"] = len(to_update)
         st.rerun()
+
+
+@st.dialog("契約の詳細編集")
+def _detail_dialog(row: dict, supabase: Client) -> None:
+    """JV（複数選択）・契約日・着工日・単価をまとめて編集するダイアログ"""
+    st.markdown(f"**{row['field_name']}**　（契約NO: {row['contract_no']}）")
+
+    jv_master = load_jv_options()
+    current_jv = _jv_to_list(row.get("jv"))
+    if jv_master is None:
+        st.info(
+            "JV選択肢マスタが未作成です。migration_add_contract_fields.sql を "
+            "Supabase の SQL Editor で実行すると選択肢が使えます。"
+        )
+        jv_choices = current_jv
+    else:
+        # マスタ＋（マスタから消えたが設定済みの値）を重複なしで
+        jv_choices = list(dict.fromkeys(jv_master + current_jv))
+
+    new_jv = st.multiselect("JV（複数選択可）", jv_choices, default=current_jv)
+
+    def _to_date(v):
+        s = "" if v is None else str(v)
+        if s in ("", "nan", "None", "NaT"):
+            return None
+        try:
+            return dateutil_parser.parse(s).date()
+        except Exception:
+            return None
+
+    new_cdate = st.date_input(
+        "契約日", value=_to_date(row.get("contract_date")), format="YYYY/MM/DD"
+    )
+    new_sdate = st.date_input(
+        "着工日", value=_to_date(row.get("start_date")), format="YYYY/MM/DD"
+    )
+
+    price_raw = pd.to_numeric(row.get("unit_price"), errors="coerce")
+    new_price = st.number_input(
+        "単価（円/m³）",
+        min_value=0.0, step=100.0,
+        value=float(price_raw) if pd.notna(price_raw) else None,
+        placeholder="未入力",
+    )
+
+    if st.button("💾 保存する", type="primary", use_container_width=True):
+        supabase.table("contracts").update({
+            "jv":            ",".join(new_jv),
+            "contract_date": str(new_cdate) if new_cdate else None,
+            "start_date":    str(new_sdate) if new_sdate else None,
+            "unit_price":    float(new_price) if new_price is not None else None,
+        }).eq("contract_no", str(row["contract_no"])).execute()
+        load_data.clear()
+        st.session_state["autosaved_count"] = 1
+        st.rerun()
+
+
+def _show_detail_editor(filtered: pd.DataFrame, supabase: Client) -> None:
+    """編集モード用：契約を選んで詳細編集ダイアログを開くUI"""
+    with st.expander("📝 詳細編集（JV・契約日・着工日・単価）", expanded=False):
+        if filtered.empty:
+            st.caption("対象の契約がありません。")
+            return
+        labels = {
+            f"{r['contract_no']}｜{r['field_name']}": i
+            for i, r in filtered.iterrows()
+        }
+        choice = st.selectbox(
+            "編集する契約を選択",
+            list(labels),
+            index=None,
+            placeholder="契約NOまたは現場名で選ぶ（上の検索で絞り込むと探しやすい）",
+            key="detail_pick",
+        )
+        if choice is not None:
+            if st.button("✏️ 編集ダイアログを開く", key="btn_detail_open"):
+                row = filtered.loc[labels[choice]].to_dict()
+                _detail_dialog(row, supabase)
 
 
 def _show_add_form(existing_df: pd.DataFrame, supabase: Client) -> None:
@@ -1126,10 +1366,18 @@ def _show_add_form(existing_df: pd.DataFrame, supabase: Client) -> None:
             new_no         = st.text_input("契約NO *",       key="add_no")
             new_seller     = st.text_input("販売店",         key="add_seller")
             new_contractor = st.text_input("ゼネコン",       key="add_contractor")
+            new_cdate      = st.date_input("契約日", value=None,
+                                           format="YYYY/MM/DD", key="add_cdate")
+            new_price_str  = st.text_input("単価（円/m³）",  key="add_price")
         with a2:
             new_field      = st.text_input("現場名 *",       key="add_field")
             new_secondary  = st.text_input("二次店",         key="add_secondary")
             new_qty_str    = st.text_input("契約数量（m³）", key="add_qty")
+            new_sdate      = st.date_input("着工日", value=None,
+                                           format="YYYY/MM/DD", key="add_sdate")
+            jv_master      = load_jv_options() or []
+            new_jv         = st.multiselect("JV（複数選択可）", jv_master,
+                                            key="add_jv")
 
         if st.button("＋ 追加する", type="primary", key="btn_add"):
             if not new_no.strip():
@@ -1150,14 +1398,33 @@ def _show_add_form(existing_df: pd.DataFrame, supabase: Client) -> None:
                     st.error("契約数量は数値で入力してください")
                     return
 
-            supabase.table("contracts").insert({
+            unit_price = None
+            if new_price_str.strip():
+                try:
+                    unit_price = float(new_price_str.strip().replace(",", ""))
+                except ValueError:
+                    st.error("単価は数値で入力してください")
+                    return
+
+            payload = {
                 "contract_no":        new_no.strip(),
                 "field_name":         new_field.strip(),
                 "seller":             new_seller.strip() or None,
                 "secondary_seller":   new_secondary.strip() or None,
                 "general_contractor": new_contractor.strip() or None,
                 "contract_qty":       contract_qty,
-            }).execute()
+            }
+            # 新項目はマイグレーション未実行だと列が無いため、値がある時だけ送る
+            if new_cdate:
+                payload["contract_date"] = str(new_cdate)
+            if new_sdate:
+                payload["start_date"] = str(new_sdate)
+            if new_jv:
+                payload["jv"] = ",".join(new_jv)
+            if unit_price is not None:
+                payload["unit_price"] = unit_price
+
+            supabase.table("contracts").insert(payload).execute()
 
             st.success(
                 f"✅ 「{new_field.strip()}」を追加しました"
@@ -1437,6 +1704,24 @@ def page_csv_import() -> None:
 
 
 # ── データ管理ヘルパー ─────────────────────────────────────────────────────────
+def _rename_jv_option(supabase: Client, old: str, new: str) -> None:
+    """JV選択肢を改名し、使用中の契約のJVも書き換える"""
+    supabase.table("jv_options").update({"name": new}).eq("name", old).execute()
+    res = (
+        supabase.table("contracts")
+        .select("contract_no,jv")
+        .ilike("jv", f"%{old}%")
+        .execute()
+    )
+    for row in res.data:
+        parts = _jv_to_list(row.get("jv"))
+        if old in parts:
+            parts = [new if p == old else p for p in parts]
+            supabase.table("contracts").update(
+                {"jv": ",".join(dict.fromkeys(parts))}
+            ).eq("contract_no", row["contract_no"]).execute()
+
+
 def _fetch_all(supabase: Client, table: str, select: str = "*") -> list[dict]:
     """テーブル全件をページネーションで取得する"""
     rows: list[dict] = []
@@ -1487,6 +1772,10 @@ def _build_backup_zip(supabase: Client) -> bytes:
         "general_contractor": "ゼネコン",
         "field_name":         "現場名",
         "contract_qty":       "契約数量(m3)",
+        "contract_date":      "契約日",
+        "start_date":         "着工日",
+        "jv":                 "JV",
+        "unit_price":         "単価(円/m3)",
         "memo":               "備考",
     }
     if cdf.empty:
@@ -1806,6 +2095,58 @@ def page_data_management() -> None:
             ):
                 st.session_state["pending_month_delete"] = selected_months
                 st.rerun()
+
+    # ── JV選択肢の管理 ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("JV選択肢の管理")
+    jv_master = load_jv_options()
+    if jv_master is None:
+        st.caption(
+            "JV機能を使うには `migration_add_contract_fields.sql` を "
+            "Supabase の SQL Editor で1回実行してください。"
+        )
+    else:
+        st.caption(
+            "契約の詳細編集で選べるJVの選択肢です。"
+            "改名すると、設定済みの契約にも自動で反映されます。"
+        )
+        for name in jv_master:
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f"・**{name}**")
+            if c2.button("削除", key=f"btn_jv_del_{name}"):
+                supabase.table("jv_options").delete().eq("name", name).execute()
+                load_jv_options.clear()
+                st.rerun()
+
+        a1, a2 = st.columns([4, 1], vertical_alignment="bottom")
+        new_name = a1.text_input("新しい選択肢を追加", key="jv_new_name")
+        if a2.button("追加", key="btn_jv_add"):
+            if new_name.strip():
+                if new_name.strip() in jv_master:
+                    st.error("同じ名前が既にあります")
+                else:
+                    supabase.table("jv_options").insert({
+                        "name": new_name.strip(),
+                        "sort_order": len(jv_master) + 1,
+                    }).execute()
+                    load_jv_options.clear()
+                    st.rerun()
+
+        if jv_master:
+            r1, r2, r3 = st.columns([2, 2, 1], vertical_alignment="bottom")
+            ren_target = r1.selectbox("改名する選択肢", jv_master, index=None,
+                                      placeholder="選択", key="jv_ren_target")
+            ren_new = r2.text_input("新しい名前", key="jv_ren_new")
+            if r3.button("改名", key="btn_jv_rename"):
+                if ren_target and ren_new.strip():
+                    _rename_jv_option(supabase, ren_target, ren_new.strip())
+                    load_jv_options.clear()
+                    load_data.clear()
+                    st.success(
+                        f"✅ 「{ren_target}」を「{ren_new.strip()}」に改名しました"
+                        "（設定済みの契約にも反映）"
+                    )
+                    st.rerun()
 
     # ── クリーンアップ ────────────────────────────────────────────────────────
     st.markdown("---")
