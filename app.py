@@ -442,16 +442,27 @@ def page_contracts() -> None:
 
     editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
-    cap_col, pr_col, dl_col = st.columns([3.4, 0.8, 1.0])
+    cap_col, sort_col, pr_col, dl_col = st.columns(
+        [2.6, 1.4, 0.8, 1.0], vertical_alignment="center"
+    )
     cap_col.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
+    sort_label = sort_col.selectbox(
+        "並び替え",
+        list(SORT_OPTIONS),
+        key="sort_order",
+        label_visibility="collapsed",
+        help="画面の表・印刷・CSV出力すべてにこの並び順が使われます",
+    )
+    sorted_df = _apply_sort(filtered, sort_label)
     if not filtered.empty:
         with pr_col:
             components.html(
-                _print_component_html(filtered, total_count), height=44
+                _print_component_html(sorted_df, total_count, sort_label),
+                height=44,
             )
         dl_col.download_button(
             "📥 CSV出力",
-            data=_filtered_to_csv(filtered),
+            data=_filtered_to_csv(sorted_df),
             file_name=f"契約残一覧_{datetime.now():%Y%m%d}.csv",
             mime="text/csv",
             key="btn_csv_download",
@@ -466,7 +477,7 @@ def page_contracts() -> None:
     edit_mode = st.toggle("✏️ 編集モード（契約数量・備考の修正、完了削除）", key="edit_mode")
 
     if not edit_mode:
-        _render_view_table(filtered)
+        _render_view_table(sorted_df)
         st.markdown("---")
         _show_add_form(df, supabase)
         return
@@ -521,6 +532,33 @@ def page_contracts() -> None:
     _show_add_form(df, supabase)
 
 
+# ── 並び替え（画面・印刷・CSVの3つに共通で効く） ───────────────────────────────
+SORT_OPTIONS: dict[str, tuple[str, bool]] = {
+    "契約残が多い順":   ("remaining_qty", False),
+    "契約残が少ない順": ("remaining_qty", True),
+    "消化率が低い順":   ("_sort_pct", True),
+    "消化率が高い順":   ("_sort_pct", False),
+    "超過が多い順":     ("_sort_over", False),
+    "二次店順":         ("secondary_seller", True),
+    "販売店順":         ("seller", True),
+    "ゼネコン順":       ("general_contractor", True),
+    "現場名順":         ("field_name", True),
+}
+
+
+def _apply_sort(filtered: pd.DataFrame, sort_label: str) -> pd.DataFrame:
+    """選択された並び順を適用して返す"""
+    df = filtered.copy()
+    qty = pd.to_numeric(df["contract_qty"], errors="coerce")
+    shipped = pd.to_numeric(df["shipped_qty"], errors="coerce")
+    df["_sort_pct"] = (shipped / qty).where(qty > 0)
+    df["_sort_over"] = (shipped - qty).where(qty > 0).clip(lower=0)
+
+    col, asc = SORT_OPTIONS.get(sort_label, ("remaining_qty", False))
+    df = df.sort_values(col, ascending=asc, na_position="last")
+    return df.drop(columns=["_sort_pct", "_sort_over"]).reset_index(drop=True)
+
+
 def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
     """絞り込み結果を Excel でそのまま開ける CSV（CP932）に変換する"""
     out = filtered.copy()
@@ -544,13 +582,15 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
     if "memo" in out.columns:
         cols["memo"] = "備考"
     out = out[list(cols)].rename(columns=cols)
-    out = out.sort_values("契約残(m3)", ascending=False, na_position="last")
     return out.to_csv(index=False).encode("cp932", errors="replace")
 
 
-def _print_component_html(filtered: pd.DataFrame, total_count: int) -> str:
+def _print_component_html(
+    filtered: pd.DataFrame, total_count: int, sort_label: str
+) -> str:
     """印刷ボタン＋印刷用テーブルを含むHTML。
-    画面上はボタンだけ見え、印刷時はテーブルだけが紙に出る。"""
+    画面上はボタンだけ見え、印刷時はテーブルだけが紙に出る。
+    並び順は呼び出し元で適用済みのものをそのまま使う。"""
     df = filtered.copy()
     qty = pd.to_numeric(df["contract_qty"], errors="coerce")
     shipped = pd.to_numeric(df["shipped_qty"], errors="coerce")
@@ -558,7 +598,6 @@ def _print_component_html(filtered: pd.DataFrame, total_count: int) -> str:
     df["_pct"] = (shipped / qty * 100).where(qty > 0)
     df["_over"] = (shipped - qty).where(qty > 0).clip(lower=0)
     df["_warn"] = (qty > 0) & (rem / qty >= 0.5)
-    df = df.sort_values("remaining_qty", ascending=False, na_position="last")
 
     def esc(v) -> str:
         s = "" if v is None else str(v)
@@ -610,6 +649,7 @@ def _print_component_html(filtered: pd.DataFrame, total_count: int) -> str:
     count_note = f"{len(df):,} 件"
     if len(df) != total_count:
         count_note += f"（全 {total_count:,} 件から絞り込み）"
+    count_note += f"　／　並び順：{html_mod.escape(sort_label)}"
 
     return f"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="utf-8">
@@ -682,13 +722,6 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
     _qty = pd.to_numeric(view_df["contract_qty"], errors="coerce")
     _shipped = pd.to_numeric(view_df["shipped_qty"], errors="coerce")
     view_df["overage_qty"] = (_shipped - _qty).where(_qty > 0).clip(lower=0)
-
-    # 初期表示は契約残が多い順（列見出しクリックでいつでも並び替え可）
-    view_df = (
-        view_df
-        .sort_values("remaining_qty", ascending=False, na_position="last")
-        .reset_index(drop=True)
-    )
 
     view_cols = [
         "contract_no", "seller", "secondary_seller", "general_contractor",
