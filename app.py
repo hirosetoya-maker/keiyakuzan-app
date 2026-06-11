@@ -443,15 +443,14 @@ def page_contracts() -> None:
     editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
     cap_col, sort_col, pr_col, dl_col = st.columns(
-        [2.6, 1.4, 0.8, 1.0], vertical_alignment="center"
+        [2.4, 1.6, 0.8, 1.0], vertical_alignment="bottom"
     )
     cap_col.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
     sort_label = sort_col.selectbox(
-        "並び替え",
+        "🖨️ 並び順（画面・印刷・CSV 共通）",
         list(SORT_OPTIONS),
         key="sort_order",
-        label_visibility="collapsed",
-        help="画面の表・印刷・CSV出力すべてにこの並び順が使われます",
+        help="ここで選んだ並び順が、画面の表だけでなく印刷した紙とCSV出力にもそのまま使われます",
     )
     sorted_df = _apply_sort(filtered, sort_label)
     if not filtered.empty:
