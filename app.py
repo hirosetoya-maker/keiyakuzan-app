@@ -1,13 +1,16 @@
 import hashlib
 import hmac
+import html as html_mod
 import io
 import time
 import uuid
+import zipfile
 from datetime import datetime, timedelta
 
 import extra_streamlit_components as stx
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dateutil import parser as dateutil_parser
 from supabase import Client, create_client
 
@@ -166,6 +169,17 @@ def load_data() -> pd.DataFrame:
 def load_delivery_months() -> dict[str, int]:
     """deliveries テーブルから年月ごとのレコード数を返す（新しい順）"""
     supabase = get_supabase()
+
+    # DB側で集計するビューがあれば使う（高速）。なければ全行スキャン
+    try:
+        res = supabase.table("delivery_month_counts").select("*").execute()
+        return dict(sorted(
+            ((row["ym"], int(row["cnt"])) for row in res.data),
+            reverse=True,
+        ))
+    except Exception:
+        pass
+
     PAGE_SIZE = 1000
     offset = 0
     month_counts: dict[str, int] = {}
@@ -428,9 +442,13 @@ def page_contracts() -> None:
 
     editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
 
-    cap_col, dl_col = st.columns([4, 1])
+    cap_col, pr_col, dl_col = st.columns([3.4, 0.8, 1.0])
     cap_col.caption(f"表示中 **{len(filtered):,} 件** ／ 全 {total_count:,} 件")
     if not filtered.empty:
+        with pr_col:
+            components.html(
+                _print_component_html(filtered, total_count), height=44
+            )
         dl_col.download_button(
             "📥 CSV出力",
             data=_filtered_to_csv(filtered),
@@ -509,6 +527,7 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
     qty = pd.to_numeric(out["contract_qty"], errors="coerce")
     shipped = pd.to_numeric(out["shipped_qty"], errors="coerce")
     out["consumption_pct"] = (shipped / qty * 100).where(qty > 0).round(1)
+    out["overage_qty"] = (shipped - qty).where(qty > 0).clip(lower=0).round(1)
 
     cols = {
         "contract_no":        "契約NO",
@@ -519,6 +538,7 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
         "contract_qty":       "契約数量(m3)",
         "shipped_qty":        "出荷実績(m3)",
         "remaining_qty":      "契約残(m3)",
+        "overage_qty":        "超過(m3)",
         "consumption_pct":    "消化率(%)",
     }
     if "memo" in out.columns:
@@ -526,6 +546,122 @@ def _filtered_to_csv(filtered: pd.DataFrame) -> bytes:
     out = out[list(cols)].rename(columns=cols)
     out = out.sort_values("契約残(m3)", ascending=False, na_position="last")
     return out.to_csv(index=False).encode("cp932", errors="replace")
+
+
+def _print_component_html(filtered: pd.DataFrame, total_count: int) -> str:
+    """印刷ボタン＋印刷用テーブルを含むHTML。
+    画面上はボタンだけ見え、印刷時はテーブルだけが紙に出る。"""
+    df = filtered.copy()
+    qty = pd.to_numeric(df["contract_qty"], errors="coerce")
+    shipped = pd.to_numeric(df["shipped_qty"], errors="coerce")
+    rem = pd.to_numeric(df["remaining_qty"], errors="coerce")
+    df["_pct"] = (shipped / qty * 100).where(qty > 0)
+    df["_over"] = (shipped - qty).where(qty > 0).clip(lower=0)
+    df["_warn"] = (qty > 0) & (rem / qty >= 0.5)
+    df = df.sort_values("remaining_qty", ascending=False, na_position="last")
+
+    def esc(v) -> str:
+        s = "" if v is None else str(v)
+        return html_mod.escape("" if s in ("nan", "None") else s)
+
+    def num(v) -> str:
+        v = pd.to_numeric(v, errors="coerce")
+        return "" if pd.isna(v) else f"{float(v):,.1f}"
+
+    def over(v) -> str:
+        v = pd.to_numeric(v, errors="coerce")
+        return "" if pd.isna(v) or float(v) <= 0 else f"{float(v):,.1f}"
+
+    def pct(v) -> str:
+        v = pd.to_numeric(v, errors="coerce")
+        return "" if pd.isna(v) else f"{float(v):.0f}%"
+
+    body_rows = []
+    for _, r in df.iterrows():
+        cls = ' class="warn"' if bool(r["_warn"]) else ""
+        body_rows.append(
+            f"<tr{cls}>"
+            f"<td>{esc(r['contract_no'])}</td>"
+            f"<td>{esc(r['seller'])}</td>"
+            f"<td>{esc(r['secondary_seller'])}</td>"
+            f"<td>{esc(r['general_contractor'])}</td>"
+            f"<td class='l'>{esc(r['field_name'])}</td>"
+            f"<td class='r'>{num(r['contract_qty'])}</td>"
+            f"<td class='r'>{num(r['shipped_qty'])}</td>"
+            f"<td class='r'>{num(r['remaining_qty'])}</td>"
+            f"<td class='r'>{over(r['_over'])}</td>"
+            f"<td class='r'>{pct(r['_pct'])}</td>"
+            f"<td class='l'>{esc(r.get('memo', ''))}</td>"
+            "</tr>"
+        )
+
+    total_row = (
+        "<tr class='total'>"
+        "<td colspan='5'>合計</td>"
+        f"<td class='r'>{num(qty.sum())}</td>"
+        f"<td class='r'>{num(shipped.sum())}</td>"
+        f"<td class='r'>{num(rem.sum())}</td>"
+        f"<td class='r'>{over(df['_over'].sum())}</td>"
+        "<td></td><td></td>"
+        "</tr>"
+    )
+
+    printed_at = f"{datetime.now():%Y/%m/%d %H:%M}"
+    count_note = f"{len(df):,} 件"
+    if len(df) != total_count:
+        count_note += f"（全 {total_count:,} 件から絞り込み）"
+
+    return f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="utf-8">
+<style>
+@page {{ size: A4 landscape; margin: 10mm; }}
+* {{ -webkit-print-color-adjust: exact; print-color-adjust: exact; }}
+body {{ margin: 0; font-family: "Yu Gothic", "Meiryo", sans-serif; }}
+#printable {{ display: none; }}
+#printbtn {{
+    width: 100%; padding: 0.5rem 0.75rem; cursor: pointer;
+    border: 1px solid rgba(49, 51, 63, 0.2); border-radius: 0.5rem;
+    background: white; font-size: 14px; font-family: inherit;
+}}
+#printbtn:hover {{ border-color: #1e3a5f; color: #1e3a5f; }}
+@media print {{
+    #printbtn {{ display: none; }}
+    #printable {{ display: block; }}
+}}
+h1 {{ font-size: 14pt; margin: 0 0 2mm; }}
+.meta {{ font-size: 9pt; margin-bottom: 3mm; }}
+.legend {{ background: #fff3cd; padding: 0 2mm; }}
+table {{ border-collapse: collapse; width: 100%; font-size: 8.5pt; }}
+thead {{ display: table-header-group; }}
+th, td {{ border: 0.3pt solid #999; padding: 1mm 1.5mm; text-align: center; }}
+th {{ background: #e8ecf0; font-weight: bold; }}
+td.r {{ text-align: right; }}
+td.l {{ text-align: left; }}
+tr.warn td {{ background: #fff3cd; }}
+tr.total td {{ background: #e8ecf0; font-weight: bold; text-align: right; }}
+tr {{ page-break-inside: avoid; }}
+</style></head>
+<body>
+<button id="printbtn" onclick="window.print()">🖨️ 印刷</button>
+<div id="printable">
+<h1>生コン契約残一覧</h1>
+<div class="meta">
+印刷日時：{printed_at}　／　{count_note}　／
+<span class="legend">黄色の行＝契約残が契約数量の50%以上（出荷が進んでいない現場）</span>
+</div>
+<table>
+<thead><tr>
+<th>契約NO</th><th>販売店</th><th>二次店</th><th>ゼネコン</th><th>現場名</th>
+<th>契約数量<br>(m³)</th><th>出荷実績<br>(m³)</th><th>契約残<br>(m³)</th>
+<th>超過<br>(m³)</th><th>消化率</th><th>備考</th>
+</tr></thead>
+<tbody>
+{''.join(body_rows)}
+{total_row}
+</tbody>
+</table>
+</div>
+</body></html>"""
 
 
 def _render_view_table(filtered: pd.DataFrame) -> None:
@@ -541,6 +677,12 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
 
     view_df["consumption_pct"] = view_df.apply(_calc_pct, axis=1)
 
+    # 超過出荷量（契約数量を超えて出荷した分）。現場単位の確認用で、
+    # 契約残の合計には影響させない（契約残は0で打ち止めのまま）
+    _qty = pd.to_numeric(view_df["contract_qty"], errors="coerce")
+    _shipped = pd.to_numeric(view_df["shipped_qty"], errors="coerce")
+    view_df["overage_qty"] = (_shipped - _qty).where(_qty > 0).clip(lower=0)
+
     # 初期表示は契約残が多い順（列見出しクリックでいつでも並び替え可）
     view_df = (
         view_df
@@ -551,7 +693,7 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
     view_cols = [
         "contract_no", "seller", "secondary_seller", "general_contractor",
         "field_name", "contract_qty", "shipped_qty", "remaining_qty",
-        "consumption_pct",
+        "overage_qty", "consumption_pct",
     ]
     if "memo" in view_df.columns:
         view_cols.append("memo")
@@ -575,8 +717,15 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
         v = pd.to_numeric(v, errors="coerce")
         return "" if pd.isna(v) else f"{float(v):>10,.1f}"
 
+    def _fmt_overage(v):
+        v = pd.to_numeric(v, errors="coerce")
+        if pd.isna(v) or float(v) <= 0:
+            return ""  # 超過なしは空欄
+        return f"{float(v):>10,.1f}"
+
     for c in ("contract_qty", "shipped_qty", "remaining_qty"):
         view_df[c] = view_df[c].map(_fmt_qty)
+    view_df["overage_qty"] = view_df["overage_qty"].map(_fmt_overage)
 
     def _row_style(row):
         if warn_mask.iloc[row.name]:
@@ -599,6 +748,9 @@ def _render_view_table(filtered: pd.DataFrame) -> None:
                                       "出荷実績（m³）", width="small", alignment="right"),
             "remaining_qty":      st.column_config.TextColumn(
                                       "契約残（m³）", width="small", alignment="right"),
+            "overage_qty":        st.column_config.TextColumn(
+                                      "超過（m³）", width="small", alignment="right",
+                                      help="契約数量を超えて出荷した分（請求対象）。契約残合計には影響しません"),
             "consumption_pct":    st.column_config.ProgressColumn(
                                       "消化率", format="%.0f%%",
                                       min_value=0, max_value=100),
@@ -769,17 +921,36 @@ def page_csv_import() -> None:
             parse_errors.append(f"{f.name}: 列不足 → {missing}")
             continue
 
-        for _, row in df.iterrows():
+        for row_idx, row in df.iterrows():
+            line_no = int(row_idx) + 2  # ヘッダー行を除いたCSV上の行番号
             contract_no = str(row["契約ＮＯ"]).strip()
             field_no    = str(row["現場ＮＯ"]).strip()
 
-            # 出荷日パース（"2026/4/1" 形式など）
+            # 出荷日パース（"2026/4/1" 形式など）。
+            # 読めない行はDBに送らずスキップし、行番号と値を明細で報告する
+            raw_date = row["出荷日"]
             try:
+                if pd.isna(raw_date) or str(raw_date).strip() == "":
+                    raise ValueError("空欄")
                 delivery_date = dateutil_parser.parse(
-                    str(row["出荷日"])
+                    str(raw_date)
                 ).strftime("%Y-%m-%d")
             except Exception:
-                delivery_date = str(row["出荷日"]).strip()
+                parse_errors.append(
+                    f"{f.name} {line_no}行目: 出荷日が読めないためスキップ"
+                    f"（値:「{raw_date}」）"
+                )
+                continue
+
+            # 出荷量も数値チェック（不正値で取込全体が止まるのを防ぐ）
+            try:
+                qty = float(row["出荷量"]) if pd.notna(row["出荷量"]) else 0.0
+            except (ValueError, TypeError):
+                parse_errors.append(
+                    f"{f.name} {line_no}行目: 出荷量が数値でないためスキップ"
+                    f"（値:「{row['出荷量']}」）"
+                )
+                continue
 
             # 出荷伝票番号（NaN安全変換）
             v = row["出荷伝票番号"]
@@ -790,8 +961,6 @@ def page_csv_import() -> None:
                     slip_no = str(v).strip()
             else:
                 slip_no = ""
-
-            qty = float(row["出荷量"]) if pd.notna(row["出荷量"]) else 0.0
 
             all_deliveries.append({
                 "delivery_date": delivery_date,
@@ -953,6 +1122,88 @@ def page_csv_import() -> None:
 
 
 # ── データ管理ヘルパー ─────────────────────────────────────────────────────────
+def _fetch_all(supabase: Client, table: str, select: str = "*") -> list[dict]:
+    """テーブル全件をページネーションで取得する"""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        res = supabase.table(table).select(select).range(offset, offset + 999).execute()
+        rows.extend(res.data)
+        if len(res.data) < 1000:
+            break
+        offset += 1000
+    return rows
+
+
+def _build_backup_zip(supabase: Client) -> bytes:
+    """全データのバックアップZIPを作成する。
+    出荷実績はCSV取込画面でそのまま再取込できる列構成にする。"""
+    cdf = pd.DataFrame(_fetch_all(supabase, "contracts"))
+    ddf = pd.DataFrame(_fetch_all(supabase, "deliveries"))
+
+    delivery_cols = [
+        "出荷日", "現場ＮＯ", "出荷伝票番号", "出荷量", "契約ＮＯ",
+        "現場名", "施工者名", "販売店略名", "二次店略名",
+    ]
+    if not ddf.empty and not cdf.empty:
+        meta = cdf[
+            ["contract_no", "field_name", "general_contractor",
+             "seller", "secondary_seller"]
+        ]
+        merged = ddf.merge(meta, on="contract_no", how="left")
+        deliveries_out = pd.DataFrame({
+            "出荷日":       merged["delivery_date"],
+            "現場ＮＯ":     merged["field_no"],
+            "出荷伝票番号": merged["slip_no"],
+            "出荷量":       merged["delivery_qty"],
+            "契約ＮＯ":     merged["contract_no"],
+            "現場名":       merged["field_name"],
+            "施工者名":     merged["general_contractor"],
+            "販売店略名":   merged["seller"],
+            "二次店略名":   merged["secondary_seller"],
+        })
+    else:
+        deliveries_out = pd.DataFrame(columns=delivery_cols)
+
+    contract_cols = {
+        "contract_no":        "契約NO",
+        "seller":             "販売店",
+        "secondary_seller":   "二次店",
+        "general_contractor": "ゼネコン",
+        "field_name":         "現場名",
+        "contract_qty":       "契約数量(m3)",
+        "memo":               "備考",
+    }
+    if cdf.empty:
+        contracts_out = pd.DataFrame(columns=list(contract_cols.values()))
+    else:
+        use = [c for c in contract_cols if c in cdf.columns]
+        contracts_out = cdf[use].rename(columns=contract_cols)
+
+    readme = (
+        "契約残管理アプリ バックアップ\r\n"
+        f"作成日時: {datetime.now():%Y/%m/%d %H:%M}\r\n"
+        "\r\n"
+        "【復元方法】\r\n"
+        "1. 出荷実績.csv → アプリの「CSV取込」画面でそのまま取込できます\r\n"
+        "2. 契約一覧.csv → 契約数量・備考の控えです。\r\n"
+        "   取込後に契約残一覧の編集モードで入力し直してください\r\n"
+    )
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(
+            "出荷実績.csv",
+            deliveries_out.to_csv(index=False).encode("cp932", errors="replace"),
+        )
+        z.writestr(
+            "契約一覧.csv",
+            contracts_out.to_csv(index=False).encode("cp932", errors="replace"),
+        )
+        z.writestr("はじめにお読みください.txt", readme.encode("cp932", errors="replace"))
+    return buf.getvalue()
+
+
 def _delete_months_and_orphans(supabase: Client, months: list[str]) -> int:
     """月別出荷実績を削除し、出荷実績のなくなった契約も削除する。削除した契約数を返す。"""
     affected: set[str] = set()
@@ -1036,37 +1287,15 @@ def _delete_batch_and_orphans(supabase: Client, batch_id: str) -> tuple[int, int
     return deleted_rows, orphan_count
 
 
-def _count_orphan_contracts(supabase: Client) -> int:
-    """出荷実績のない契約の件数を返す"""
-    has_delivery: set[str] = set()
-    offset = 0
-    while True:
-        res = supabase.table("deliveries").select("contract_no").range(
-            offset, offset + 999
-        ).execute()
-        for row in res.data:
-            has_delivery.add(row["contract_no"])
-        if len(res.data) < 1000:
-            break
-        offset += 1000
+def _list_orphan_contracts(supabase: Client) -> list[str]:
+    """出荷実績のない契約NOの一覧を返す。
+    DB側ビュー（orphan_contracts）があれば使い、なければ全行スキャン。"""
+    try:
+        res = supabase.table("orphan_contracts").select("contract_no").execute()
+        return [row["contract_no"] for row in res.data]
+    except Exception:
+        pass
 
-    count = 0
-    offset = 0
-    while True:
-        res = supabase.table("contracts").select("contract_no").range(
-            offset, offset + 999
-        ).execute()
-        for row in res.data:
-            if row["contract_no"] not in has_delivery:
-                count += 1
-        if len(res.data) < 1000:
-            break
-        offset += 1000
-    return count
-
-
-def _delete_orphan_contracts(supabase: Client) -> int:
-    """出荷実績のない契約をすべて削除する。削除件数を返す。"""
     has_delivery: set[str] = set()
     offset = 0
     while True:
@@ -1091,7 +1320,12 @@ def _delete_orphan_contracts(supabase: Client) -> int:
         if len(res.data) < 1000:
             break
         offset += 1000
+    return orphans
 
+
+def _delete_orphan_contracts(supabase: Client) -> int:
+    """出荷実績のない契約をすべて削除する。削除件数を返す。"""
+    orphans = _list_orphan_contracts(supabase)
     for i in range(0, len(orphans), 200):
         supabase.table("contracts").delete().in_(
             "contract_no", orphans[i : i + 200]
@@ -1181,6 +1415,27 @@ def page_data_management() -> None:
                 st.rerun()
         return
 
+    # ── バックアップ ──────────────────────────────────────────────────────────
+    st.subheader("バックアップ")
+    st.caption(
+        "全データ（契約一覧・出荷実績）をCSVで保存します。"
+        "出荷実績はCSV取込画面からそのまま復元できます。削除操作の前に取っておくと安心です。"
+    )
+    if st.button("📦 バックアップファイルを作成", key="btn_make_backup"):
+        with st.spinner("バックアップ作成中..."):
+            st.session_state["backup_zip"] = _build_backup_zip(supabase)
+            st.session_state["backup_at"] = f"{datetime.now():%Y%m%d_%H%M}"
+    if "backup_zip" in st.session_state:
+        st.download_button(
+            f"💾 ダウンロード（契約残バックアップ_{st.session_state['backup_at']}.zip）",
+            data=st.session_state["backup_zip"],
+            file_name=f"契約残バックアップ_{st.session_state['backup_at']}.zip",
+            mime="application/zip",
+            key="btn_dl_backup",
+        )
+
+    st.markdown("---")
+
     # ── 取込履歴（ファイル単位） ──────────────────────────────────────────────
     st.subheader("取込履歴（ファイル単位）")
     batches = load_import_batches()
@@ -1240,7 +1495,7 @@ def page_data_management() -> None:
     # ── クリーンアップ ────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("クリーンアップ")
-    orphan_count = _count_orphan_contracts(supabase)
+    orphan_count = len(_list_orphan_contracts(supabase))
     if orphan_count > 0:
         st.caption(
             f"出荷データと紐づいていない契約が **{orphan_count:,}件** あります。"
