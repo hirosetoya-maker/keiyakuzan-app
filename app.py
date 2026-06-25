@@ -372,6 +372,188 @@ def show_login() -> None:
         st.caption("※ パスワードは管理者にお問合せください")
 
 
+def _vals_equal(col: str, edited, initial) -> bool:
+    """編集値と初期値が実質同じなら True（二重保存防止用）"""
+    import math
+    if col in ("contract_qty", "unit_price"):
+        def _n(v):
+            if v is None:
+                return None
+            try:
+                f = float(v)
+                return None if math.isnan(f) else f
+            except (TypeError, ValueError):
+                return None
+        return _n(edited) == _n(initial)
+    if col == "memo":
+        return (edited or "") == (initial or "")
+    if col in ("contract_date", "start_date"):
+        return edited == initial
+    if col == "jv":
+        def _jv(v):
+            if isinstance(v, list):
+                return sorted(v)
+            if not v:
+                return []
+            return sorted(x.strip() for x in str(v).split(",") if x.strip())
+        return _jv(edited) == _jv(initial)
+    return edited == initial
+
+
+@st.fragment
+def _data_editor_fragment(supabase: Client) -> None:
+    """データエディタをフラグメントとして描画。
+    保存後は fragment スコープのみリランするため、スクロール位置が保持される。"""
+    f_query      = st.session_state.get("f_query", "")
+    f_seller     = st.session_state.get("f_seller", "")
+    f_secondary  = st.session_state.get("f_secondary", "")
+    f_contractor = st.session_state.get("f_contractor", "")
+    f_field      = st.session_state.get("f_field", "")
+    sort_label   = st.session_state.get("sort_order", list(SORT_OPTIONS)[0])
+
+    # キャッシュクリア後は最新データを取得
+    df = load_data()
+
+    # フィルタ適用
+    filtered = df.copy()
+    if f_query:
+        search_cols = [
+            "seller", "secondary_seller", "general_contractor",
+            "field_name", "contract_no", "memo",
+        ]
+        mask = pd.Series(False, index=filtered.index)
+        for col in search_cols:
+            if col in filtered.columns:
+                mask |= (
+                    filtered[col].astype(str)
+                    .str.contains(f_query, case=False, na=False)
+                )
+        filtered = filtered[mask]
+    if f_seller:
+        filtered = filtered[
+            filtered["seller"].str.contains(f_seller, case=False, na=False)
+        ]
+    if f_secondary:
+        filtered = filtered[
+            filtered["secondary_seller"].str.contains(f_secondary, case=False, na=False)
+        ]
+    if f_contractor:
+        filtered = filtered[
+            filtered["general_contractor"].str.contains(f_contractor, case=False, na=False)
+        ]
+    if f_field:
+        filtered = filtered[
+            filtered["field_name"].str.contains(f_field, case=False, na=False)
+        ]
+    filtered = (
+        filtered
+        .sort_values("secondary_seller", ascending=True, na_position="last")
+        .reset_index(drop=True)
+    )
+    sorted_df = _apply_sort(filtered, sort_label)
+
+    memo_col = "memo" if "memo" in sorted_df.columns else None
+    display_cols = [
+        "contract_no", "seller", "secondary_seller", "general_contractor",
+        "field_name", "contract_date", "start_date", "jv",
+        "contract_qty", "shipped_qty", "remaining_qty", "unit_price",
+    ]
+    if memo_col:
+        display_cols.append("memo")
+    display_df = sorted_df[display_cols].copy()
+    for col in ("contract_qty", "remaining_qty", "unit_price"):
+        if col in display_df.columns:
+            display_df[col] = pd.to_numeric(
+                display_df[col], errors="coerce"
+            ).astype("Float64")
+    for col in ("contract_date", "start_date"):
+        display_df[col] = pd.to_datetime(
+            display_df[col], errors="coerce"
+        ).dt.date
+    display_df["jv"] = display_df["jv"].map(_jv_to_list)
+    jv_master = load_jv_options()
+    jv_choices = list(dict.fromkeys(
+        (jv_master or [])
+        + [v for lst in display_df["jv"] for v in lst]
+    ))
+    display_df["is_completed"] = False
+
+    col_config = {
+        "contract_no":        st.column_config.TextColumn(
+                                  "契約NO", disabled=True, width="small"),
+        "seller":             st.column_config.TextColumn("販売店", disabled=True),
+        "secondary_seller":   st.column_config.TextColumn("二次店", disabled=True),
+        "general_contractor": st.column_config.TextColumn("ゼネコン", disabled=True),
+        "field_name":         st.column_config.TextColumn(
+                                  "現場名", disabled=True, width="large"),
+        "contract_date":      st.column_config.DateColumn(
+                                  "契約日", format="YYYY/MM/DD"),
+        "start_date":         st.column_config.DateColumn(
+                                  "着工日", format="YYYY/MM/DD"),
+        "jv":                 st.column_config.MultiselectColumn(
+                                  "JV", options=jv_choices, width="medium",
+                                  help="セルをクリックすると複数選択できます。"
+                                       "選択肢の追加はデータ管理ページのJVマスタから"),
+        "contract_qty":       st.column_config.NumberColumn(
+                                  "契約数量（m³）", min_value=0, step=0.5),
+        "shipped_qty":        st.column_config.NumberColumn(
+                                  "出荷実績（m³）", format="%g", disabled=True),
+        "remaining_qty":      st.column_config.NumberColumn(
+                                  "契約残（m³）", disabled=True),
+        "unit_price":         st.column_config.NumberColumn(
+                                  "単価（円/m³）", min_value=0, step=100),
+        "memo":               st.column_config.TextColumn("備考", width="medium"),
+        "is_completed":       st.column_config.CheckboxColumn("✅ 完了"),
+    }
+
+    editor_key = f"editor_{f_query}_{f_seller}_{f_secondary}_{f_contractor}_{f_field}"
+
+    st.data_editor(
+        display_df,
+        column_config=col_config,
+        use_container_width=True,
+        hide_index=True,
+        num_rows="fixed",
+        key=editor_key,
+    )
+
+    editor_state = st.session_state.get(editor_key, {})
+    edited_rows  = editor_state.get("edited_rows", {})
+
+    # 完了チェック済み行を収集 → まとめて削除ボタン
+    checked_for_delete = [
+        {
+            "contract_no": str(display_df.iloc[int(idx)]["contract_no"]),
+            "field_name":  str(display_df.iloc[int(idx)]["field_name"]),
+        }
+        for idx, changes in edited_rows.items()
+        if changes.get("is_completed")
+    ]
+    if checked_for_delete:
+        st.warning(f"⚠️ **{len(checked_for_delete)}件** が完了チェックされています")
+        if st.button(
+            f"🗑️ 完了現場を削除（{len(checked_for_delete)}件）",
+            type="primary", key="btn_batch_delete",
+        ):
+            st.session_state["pending_delete"] = checked_for_delete
+            st.rerun()
+
+    # 数量・備考・日付・単価・JVの自動保存（初期値と同値なら保存しない＝二重保存防止）
+    EDITABLE = ("contract_qty", "memo", "contract_date", "start_date",
+                "unit_price", "jv")
+    save_edits = {}
+    for _idx, _changes in edited_rows.items():
+        _row = display_df.iloc[int(_idx)]
+        _real = {
+            k: v for k, v in _changes.items()
+            if k in EDITABLE and not _vals_equal(k, v, _row.get(k))
+        }
+        if _real:
+            save_edits[_idx] = _real
+    if save_edits:
+        _handle_save(display_df, save_edits, supabase)
+
+
 # ── Page 1: 契約残一覧 ─────────────────────────────────────────────────────────
 def page_contracts() -> None:
     st.header("契約残一覧")
@@ -597,61 +779,8 @@ def page_contracts() -> None:
         _show_add_form(df, supabase)
         return
 
-    edit_mode = st.toggle("✏️ 編集モード（契約数量・備考の修正、完了削除）", key="edit_mode")
-
-    if not edit_mode:
-        _render_view_table(sorted_df, supabase)
-        st.markdown("---")
-        _show_add_form(df, supabase)
-        return
-
-    # ── 編集モード ────────────────────────────────────────────────────────────
-    # 自動保存済みメッセージ
-    if st.session_state.pop("autosaved_count", None):
-        st.success("✅ 自動保存しました")
-
-    # データエディタ
-    st.data_editor(
-        display_df,
-        column_config=col_config,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        key=editor_key,
-    )
-
-    editor_state = st.session_state.get(editor_key, {})
-    edited_rows  = editor_state.get("edited_rows", {})
-
-    # 完了チェック済み行を収集 → まとめて削除ボタン
-    checked_for_delete = [
-        {
-            "contract_no": str(display_df.iloc[int(idx)]["contract_no"]),
-            "field_name":  str(display_df.iloc[int(idx)]["field_name"]),
-        }
-        for idx, changes in edited_rows.items()
-        if changes.get("is_completed")
-    ]
-    if checked_for_delete:
-        st.warning(f"⚠️ **{len(checked_for_delete)}件** が完了チェックされています")
-        if st.button(
-            f"🗑️ 完了現場を削除（{len(checked_for_delete)}件）",
-            type="primary", key="btn_batch_delete",
-        ):
-            st.session_state["pending_delete"] = checked_for_delete
-            st.rerun()
-
-    # 数量・備考・日付・単価・JVの自動保存
-    EDITABLE = ("contract_qty", "memo", "contract_date", "start_date",
-                "unit_price", "jv")
-    save_edits = {
-        idx: {k: v for k, v in changes.items() if k in EDITABLE}
-        for idx, changes in edited_rows.items()
-        if any(k in EDITABLE for k in changes)
-    }
-    if save_edits:
-        _handle_save(display_df, save_edits, supabase)
-
+    # データエディタ（常時編集可・フラグメントで保存後のスクロール位置を保持）
+    _data_editor_fragment(supabase)
 
     # ── 手動追加フォーム ──────────────────────────────────────────────────────
     st.markdown("---")
@@ -1315,8 +1444,7 @@ def _handle_save(
                 "もう一度入力し直してください。\n\n" + "\n\n".join(errors)
             )
         else:
-            st.session_state["autosaved_count"] = len(to_update)
-            st.rerun()
+            st.toast("✅ 保存しました")
 
 
 @st.dialog("契約の詳細編集")
