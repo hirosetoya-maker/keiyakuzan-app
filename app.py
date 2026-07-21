@@ -1197,7 +1197,7 @@ def _render_view_table(filtered: pd.DataFrame, supabase: Client) -> None:
     event = st.dataframe(
         styler,
         column_config={
-            "contract_no":        st.column_config.TextColumn("契約NO", width="small"),
+            "contract_no":        st.column_config.TextColumn("契約NO 📝", width="small", help="行をクリックすると編集できます"),
             "seller":             st.column_config.TextColumn("販売店", width="medium"),
             "secondary_seller":   st.column_config.TextColumn("二次店", width="small"),
             "general_contractor": st.column_config.TextColumn("ゼネコン", width="medium"),
@@ -1232,9 +1232,7 @@ def _render_view_table(filtered: pd.DataFrame, supabase: Client) -> None:
         selection_mode="single-row",
     )
     st.caption(
-        "🟨 黄色の行＝契約残が50%以上（出荷が進んでいない要注意現場）　／　"
-        "行をクリックすると詳細編集（JV・契約日・着工日・単価）が開きます　／　"
-        "列見出しクリックで並び替え"
+        "🟨 黄色の行＝契約残が50%以上（出荷が進んでいない要注意現場）　／　列見出しクリックで並び替え"
     )
 
     # 行が選択されたら詳細編集ダイアログを開く（同じ選択での再オープンは防ぐ）

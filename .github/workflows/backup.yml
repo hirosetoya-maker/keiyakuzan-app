@@ -1,0 +1,40 @@
+name: Daily backup & keep-alive
+
+on:
+  schedule:
+    # 毎日 18:00 UTC = 日本時間 3:00
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install supabase
+
+      - name: Run backup
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python scripts/backup.py
+
+      - name: Commit backup if changed
+        run: |
+          git config user.name "backup-bot"
+          git config user.email "actions@github.com"
+          git add backups/latest
+          if git diff --cached --quiet; then
+            echo "変更なし"
+          else
+            git commit -m "chore: 自動バックアップ更新 ($(date -u +%Y-%m-%d))"
+            git push
+          fi
